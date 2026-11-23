@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>Lit Reactivity Playground</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="playground-shell">
+      <main class="app-pane">
+        <header class="app-header">
+          <div>
+            <p class="eyebrow">
+              Lit + @lit/context + memoizeOne + EventTarget Model/Controller
+            </p>
+            <h1>Flight Telemetry Playground</h1>
+          </div>
+          <button
+            type="button"
+            id="toggle-inspector"
+            class="btn secondary"
+            aria-expanded="true"
+          >
+            Hide Embedded DevTools
+          </button>
+        </header>
+
+        <section class="controls-card" aria-label="Model Mutators">
+          <h2>FlightModelManager Inputs <span class="badge">Model</span></h2>
+          <div class="controls-row">
+            <div class="field">
+              <label for="alt-input">Altitude (ft)</label>
+              <div class="stepper">
+                <button type="button" id="alt-dec">−1000</button>
+                <input id="alt-input" type="number" value="12000" step="500" />
+                <button type="button" id="alt-inc">+1000</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="spd-input">Airspeed (kt)</label>
+              <div class="stepper">
+                <button type="button" id="spd-dec">−20</button>
+                <input id="spd-input" type="number" value="185" step="5" />
+                <button type="button" id="spd-inc">+20</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="status-input">Status Note</label>
+              <div class="stepper">
+                <input id="status-input" type="text" value="Nominal cruise" />
+                <button type="button" id="status-apply" class="btn">
+                  Update
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="actions-row">
+            <button type="button" id="low-alt-trigger" class="btn danger">
+              Trigger Low Altitude Warning
+            </button>
+            <button type="button" id="burst-btn" class="btn primary">
+              Run 4-Tick Heading Sweep
+            </button>
+            <span
+              class="observer-pill"
+              id="observer-log"
+              data-testid="observer-log"
+              >OK: Nominal cruise</span
+            >
+          </div>
+        </section>
+
+        <section class="host-mount" aria-label="Lit Component Tree">
+          <x-cockpit-shell id="cockpit-shell"></x-cockpit-shell>
+        </section>
+      </main>
+
+      <aside
+        class="inspector-pane"
+        aria-label="Embedded Lit Reactivity DevTools"
+      >
+        <iframe
+          id="panel-frame"
+          title="Lit Reactivity DevTools"
+          src="panel.html"
+        ></iframe>
+      </aside>
+    </div>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

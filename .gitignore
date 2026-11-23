@@ -1,0 +1,27 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.DS_Store
+*.tsbuildinfo
+
+# Secrets & keys
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+
+# Local agent & editor state
+.opencode/
+.omo/
+.claude/
+.cursor/
+.vscode/

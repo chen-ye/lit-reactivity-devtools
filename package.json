@@ -1,0 +1,34 @@
+{
+  "name": "lit-reactivity-devtools",
+  "version": "0.1.0",
+  "description": "Chrome DevTools extension for tracing reactive properties, models, controllers, @lit/context streams, memoize-one computeds/observers, and custom events across Lit and web components.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/types/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    }
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "dev": "bun run scripts/dev-demo.ts",
+    "check": "bun check --no-script",
+    "fmt": "bun fmt --no-script",
+    "fmt:check": "bun fmt --no-script --check",
+    "lint": "bunx oxlint --type-aware",
+    "test": "bun test tests/unit",
+    "test:e2e": "bunx playwright test -c tests/e2e/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@lit/context": "^1.1.6",
+    "@playwright/test": "^1.65.1",
+    "@types/bun": "^1.4.5",
+    "@types/chrome": "^0.1.43",
+    "lit": "^3.1.4",
+    "memoize-one": "^6.0.0",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2008",
+    "typescript": "^7.0.2"
+  }
+}
