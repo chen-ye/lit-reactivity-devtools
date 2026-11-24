@@ -24,19 +24,27 @@ export function createLitDevtoolsHook(
           },
         }
       : {}),
-    registerModel(model, options) {
+    registerModel: function __LIT_DEVTOOLS__registerModel(model, options) {
       return tracker.registerModel(model, options);
     },
-    registerController(controller, options) {
+    registerController: function __LIT_DEVTOOLS__registerController(
+      controller,
+      options,
+    ) {
       return tracker.registerController(controller, options);
     },
-    label(target, name) {
+    label: function __LIT_DEVTOOLS__label(target, name) {
       return tracker.label(target, name);
     },
-    traceMemoized(fn, owner, name, role) {
+    traceMemoized: function __LIT_DEVTOOLS__traceMemoized(
+      fn,
+      owner,
+      name,
+      role,
+    ) {
       return tracker.traceMemoized(fn, owner, name, role);
     },
-    scanDom() {
+    scanDom: function __LIT_DEVTOOLS__scanDom() {
       tracker.scanDom();
     },
     snapshot(sinceSeq) {
@@ -59,6 +67,9 @@ export function createLitDevtoolsHook(
     },
     selectElementFromElementsPanel(el) {
       return tracker.selectElementFromElementsPanel(el);
+    },
+    getDefinitionTarget(nodeId, propName) {
+      return tracker.getDefinitionTarget(nodeId, propName);
     },
     configure(settings) {
       tracker.configure(settings);

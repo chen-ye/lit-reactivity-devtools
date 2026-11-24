@@ -23,6 +23,55 @@ import { formatErrorMessage, serializePreview } from "./preview.ts";
 import { captureCallsite } from "./stack.ts";
 
 const MAX_EVENTS = 400;
+const MAX_CTOR_SOURCE_CHARS = 120_000;
+const MAX_COMPUTE_SOURCE_CHARS = 1200;
+const MAX_COMPUTE_SIGNATURE_CHARS = 120;
+const MAX_DISAMBIGUATOR_TEXT_CHARS = 24;
+
+const DISAMBIGUATOR_PROP_PRIORITY = [
+  "key",
+  "id",
+  "ident",
+  "code",
+  "label",
+  "title",
+  "name",
+  "text",
+  "heading",
+  "icon",
+  "mode",
+  "panel",
+  "tab",
+  "action",
+  "command",
+  "channel",
+  "range",
+  "rangeNm",
+  "distance",
+  "radius",
+  "unit",
+  "variant",
+  "kind",
+  "type",
+  "index",
+] as const;
+
+const JS_NON_CALL_KEYWORDS = new Set([
+  "new",
+  "function",
+  "async",
+  "typeof",
+  "return",
+  "if",
+  "while",
+  "for",
+  "switch",
+  "catch",
+  "await",
+  "void",
+  "delete",
+  "throw",
+]);
 
 interface PropertyRecord {
   readonly name: string;
@@ -43,9 +92,15 @@ interface NodeRecord {
   readonly ref: WeakRef<object>;
   label: string;
   subtitle: string | null;
-  readonly site: SourceLocation | null;
+  site: SourceLocation | null;
   connected: boolean;
   ownerNodeId?: number;
+  domParentNodeId?: number | undefined;
+  tagName?: string;
+  explicitLabel?: string;
+  disambiguator?: string | null;
+  lockedDisambiguator?: string | null;
+  lockedDisambiguatorRank?: number | undefined;
   updates: number;
   hits: number;
   misses: number;
@@ -60,6 +115,10 @@ interface NodeRecord {
   properties?: Map<string, PropertyRecord>;
   lastArgs?: ReadonlyArray<ValuePreview>;
   clearMemoFn?: () => void;
+  computeSource?: string | null;
+  computeSignature?: string | null;
+  innerMemoFnRef?: WeakRef<(...args: never[]) => unknown>;
+  providerHostRef?: WeakRef<object>;
 }
 
 interface EdgeRecord {
@@ -161,17 +220,472 @@ function safeReadProp(
   }
 }
 
+function isCallableFn(value: unknown): value is (...args: never[]) => unknown {
+  return typeof value === "function";
+}
+
+function isNativeCodeFn(fn: unknown): boolean {
+  if (!isCallableFn(fn)) return true;
+  try {
+    return Function.prototype.toString.call(fn).includes("[native code]");
+  } catch {
+    return true;
+  }
+}
+
+function isUserConstructor(
+  value: unknown,
+): value is (...args: never[]) => unknown {
+  if (typeof value !== "function") return false;
+  const obj: object = value;
+  if (obj === Object || obj === Function) return false;
+  if (typeof HTMLElement !== "undefined" && obj === HTMLElement) return false;
+  if (typeof EventTarget !== "undefined" && obj === EventTarget) return false;
+  return true;
+}
+
+function isMemoizeOneWrapperSource(src: string): boolean {
+  return (
+    /\bcache\.lastThis\b/.test(src) || /\.lastThis\s*===\s*this\b/.test(src)
+  );
+}
+
+function normalizeMemoSource(
+  raw: string,
+): { readonly source: string; readonly signature: string } | null {
+  if (!raw || raw.includes("[native code]") || isMemoizeOneWrapperSource(raw)) {
+    return null;
+  }
+  const normalized = raw.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) return null;
+
+  const lines = normalized.split("\n");
+  let minIndent = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (line.trim().length === 0) continue;
+    const match = /^[ \t]*/.exec(line);
+    const indentLen = match ? match[0].length : 0;
+    if (indentLen < minIndent) {
+      minIndent = indentLen;
+    }
+  }
+
+  const dedented =
+    Number.isFinite(minIndent) && minIndent > 0
+      ? [
+          lines[0] ?? "",
+          ...lines
+            .slice(1)
+            .map((line) =>
+              line.trim().length === 0 ? "" : line.slice(minIndent),
+            ),
+        ].join("\n")
+      : normalized;
+
+  const source =
+    dedented.length > MAX_COMPUTE_SOURCE_CHARS
+      ? `${dedented.slice(0, MAX_COMPUTE_SOURCE_CHARS - 1)}…`
+      : dedented;
+  const collapsed = dedented.replace(/\s+/g, " ").trim();
+  const signature =
+    collapsed.length > MAX_COMPUTE_SIGNATURE_CHARS
+      ? `${collapsed.slice(0, MAX_COMPUTE_SIGNATURE_CHARS - 1)}…`
+      : collapsed;
+
+  return { source, signature };
+}
+
+function skipQuotedString(
+  src: string,
+  startIdx: number,
+  quote: string,
+): number {
+  let i = startIdx + 1;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === quote) {
+      return i + 1;
+    }
+    i++;
+  }
+  return src.length;
+}
+
+function skipRegexLiteral(src: string, startIdx: number): number {
+  let i = startIdx + 1;
+  let inClass = false;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+    } else if (ch === "]" && inClass) {
+      inClass = false;
+    } else if (ch === "/" && !inClass) {
+      return i + 1;
+    } else if (ch === "\n") {
+      return i + 1;
+    }
+    i++;
+  }
+  return src.length;
+}
+
+function skipComment(src: string, startIdx: number): number {
+  if (src[startIdx] !== "/") return startIdx;
+  if (src[startIdx + 1] === "/") {
+    const nl = src.indexOf("\n", startIdx + 2);
+    return nl === -1 ? src.length : nl + 1;
+  }
+  if (src[startIdx + 1] === "*") {
+    const end = src.indexOf("*/", startIdx + 2);
+    return end === -1 ? src.length : end + 2;
+  }
+  return startIdx;
+}
+
+function skipWsAndComments(src: string, startIdx: number): number {
+  let i = startIdx;
+  while (i < src.length) {
+    const ch = src[i] ?? "";
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      i++;
+      continue;
+    }
+    if (ch === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      i = skipComment(src, i);
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+function skipBraceBlock(src: string, startAfterOpenBrace: number): number {
+  let i = startAfterOpenBrace;
+  let depth = 1;
+  while (i < src.length && depth > 0) {
+    const ch = src[i] ?? "";
+    if (ch === "'" || ch === '"') {
+      i = skipQuotedString(src, i, ch);
+      continue;
+    }
+    if (ch === "`") {
+      i = skipTemplateLiteral(src, i);
+      continue;
+    }
+    if (ch === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      i = skipComment(src, i);
+      continue;
+    }
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+    }
+    i++;
+  }
+  return i;
+}
+
+function skipTemplateLiteral(src: string, tickIdx: number): number {
+  let i = tickIdx + 1;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "`") {
+      return i + 1;
+    }
+    if (ch === "$" && src[i + 1] === "{") {
+      i = skipBraceBlock(src, i + 2);
+      continue;
+    }
+    i++;
+  }
+  return src.length;
+}
+
+function scanFirstCallArg(src: string, openParenIdx: number): string | null {
+  let i = skipWsAndComments(src, openParenIdx + 1);
+  const argStart = i;
+  let parenDepth = 1;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let prevNonWs = "(";
+
+  while (i < src.length) {
+    const ch = src[i] ?? "";
+    if (ch === "'" || ch === '"') {
+      i = skipQuotedString(src, i, ch);
+      prevNonWs = ch;
+      continue;
+    }
+    if (ch === "`") {
+      i = skipTemplateLiteral(src, i);
+      prevNonWs = "`";
+      continue;
+    }
+    if (ch === "/") {
+      if (src[i + 1] === "/" || src[i + 1] === "*") {
+        i = skipComment(src, i);
+        continue;
+      }
+      if ("(=,[!&|?:{};\n".includes(prevNonWs)) {
+        i = skipRegexLiteral(src, i);
+        prevNonWs = "/";
+        continue;
+      }
+    }
+
+    if (ch === "(") {
+      parenDepth++;
+    } else if (ch === ")") {
+      parenDepth--;
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        return src.slice(argStart, i).trim();
+      }
+    } else if (ch === "[") {
+      bracketDepth++;
+    } else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth--;
+    } else if (ch === "{") {
+      braceDepth++;
+    } else if (ch === "}") {
+      if (braceDepth > 0) braceDepth--;
+    } else if (
+      ch === "," &&
+      parenDepth === 1 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return src.slice(argStart, i).trim();
+    }
+
+    if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") {
+      prevNonWs = ch;
+    }
+    i++;
+  }
+  return null;
+}
+
+function extractMemoFromCtorSource(
+  ctorSrc: string,
+  fieldName: string,
+): { readonly source: string; readonly signature: string } | null {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const assignRe = new RegExp(
+    `(?:this\\s*\\.\\s*|(?<![.$\\w]))${escapedField}\\s*=\\s*`,
+    "g",
+  );
+  let match: RegExpExecArray | null;
+  while ((match = assignRe.exec(ctorSrc)) !== null) {
+    let pos = skipWsAndComments(ctorSrc, match.index + match[0].length);
+    const tail = ctorSrc.slice(pos);
+    const tracePrefix = /^(?:[A-Za-z_$][\w$]*\s*\.\s*)*traceMemoized\s*\(/.exec(
+      tail,
+    );
+    if (tracePrefix) {
+      pos = skipWsAndComments(ctorSrc, pos + tracePrefix[0].length);
+    }
+
+    const afterTrace = ctorSrc.slice(pos);
+    const callMatch =
+      /^(?:\(\s*0\s*,\s*[A-Za-z_$][\w$.]*\s*\)|([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*))\s*\(/.exec(
+        afterTrace,
+      );
+    if (!callMatch) continue;
+    const calleeName = callMatch[1];
+    if (calleeName && JS_NON_CALL_KEYWORDS.has(calleeName)) continue;
+
+    const openParenIdx = pos + callMatch[0].length - 1;
+    const extracted = scanFirstCallArg(ctorSrc, openParenIdx);
+    if (!extracted) continue;
+    const normalized = normalizeMemoSource(extracted);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function isLitSyntheticGetter(fn: unknown): boolean {
+  if (!isCallableFn(fn)) return false;
+  try {
+    const src = Function.prototype.toString.call(fn).trim();
+    return (
+      /^(?:function\s*)?get\s*\(\s*\)\s*\{\s*return\s+this\[[^\]]+\];?\s*\}$/.test(
+        src,
+      ) || /^\(\s*\)\s*=>\s*this\[[^\]]+\]$/.test(src)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLitSyntheticSetter(fn: unknown): boolean {
+  if (!isCallableFn(fn)) return false;
+  try {
+    const src = Function.prototype.toString.call(fn).trim();
+    return /^(?:function\s*)?set\s*\([^)]*\)\s*\{[\s\S]*this\.requestUpdate\s*\(/.test(
+      src,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function truncateLabelText(
+  text: string,
+  maxLen = MAX_DISAMBIGUATOR_TEXT_CHARS,
+): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxLen) return collapsed;
+  return `${collapsed.slice(0, maxLen - 1)}…`;
+}
+
+function collectReadableText(root: Node, maxChars = 48): string {
+  const parts: string[] = [];
+  let len = 0;
+  const walk = (node: Node): void => {
+    if (len >= maxChars) return;
+    if (isElement(node)) {
+      const tag = node.tagName.toUpperCase();
+      if (tag === "STYLE" || tag === "SCRIPT" || tag === "TEMPLATE") return;
+    }
+    const childNodes = node.childNodes;
+    if (!childNodes || childNodes.length === 0) {
+      const text = node.textContent?.trim();
+      if (text) {
+        parts.push(text);
+        len += text.length + 1;
+      }
+      return;
+    }
+    for (let i = 0; i < childNodes.length; i++) {
+      const child = childNodes[i];
+      if (child) walk(child);
+      if (len >= maxChars) break;
+    }
+  };
+  walk(root);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function extractElementShortText(
+  el: Element,
+  closedShadow?: ShadowRoot,
+): string | null {
+  if (el.children.length === 0) {
+    const lightLeaf = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    if (lightLeaf.length >= 1 && lightLeaf.length <= 28) {
+      return truncateLabelText(lightLeaf);
+    }
+  }
+
+  const renderRoot: unknown = Reflect.get(el, "renderRoot");
+  const root = isShadowRoot(renderRoot)
+    ? renderRoot
+    : isShadowRoot(el.shadowRoot)
+      ? el.shadowRoot
+      : closedShadow;
+
+  if (root) {
+    if (typeof root.querySelector === "function") {
+      const btn = root.querySelector("button, [role='button']");
+      if (btn) {
+        const btnText = collectReadableText(btn);
+        if (btnText.length >= 1 && btnText.length <= 28) {
+          return truncateLabelText(btnText);
+        }
+      }
+    }
+    const shadowText = collectReadableText(root);
+    if (shadowText.length >= 1 && shadowText.length <= 28) {
+      return truncateLabelText(shadowText);
+    }
+  }
+
+  if (el.children.length > 0) {
+    const lightText = collectReadableText(el);
+    if (lightText.length >= 1 && lightText.length <= 28) {
+      return truncateLabelText(lightText);
+    }
+  }
+
+  return null;
+}
+
+function getDomAncestryPath(el: Element): Node[] {
+  const path: Node[] = [];
+  let cursor: Node | null = el;
+  let depth = 0;
+  while (cursor && depth < 512) {
+    depth++;
+    path.push(cursor);
+    cursor = isShadowRoot(cursor) ? cursor.host : cursor.parentNode;
+  }
+  path.reverse();
+  return path;
+}
+
+function compareDomOrder(
+  a: Element,
+  b: Element,
+  idA: number,
+  idB: number,
+): number {
+  if (a === b) return 0;
+  const pathA = getDomAncestryPath(a);
+  const pathB = getDomAncestryPath(b);
+  if (pathA[0] === pathB[0]) {
+    const limit = Math.min(pathA.length, pathB.length);
+    let diffIdx = 0;
+    while (diffIdx < limit && pathA[diffIdx] === pathB[diffIdx]) {
+      diffIdx++;
+    }
+    if (diffIdx > 0 && diffIdx < limit) {
+      const parent = pathA[diffIdx - 1];
+      const branchA = pathA[diffIdx];
+      const branchB = pathB[diffIdx];
+      if (parent && branchA && branchB) {
+        const children = parent.childNodes;
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          if (child === branchA) return -1;
+          if (child === branchB) return 1;
+        }
+        if (isShadowRoot(branchA) && !isShadowRoot(branchB)) return -1;
+        if (isShadowRoot(branchB) && !isShadowRoot(branchA)) return 1;
+        if (typeof branchA.compareDocumentPosition === "function") {
+          const pos = branchA.compareDocumentPosition(branchB);
+          if ((pos & 4) !== 0) return -1;
+          if ((pos & 2) !== 0) return 1;
+        }
+      }
+    }
+  }
+  return idA - idB;
+}
+
 function findBaseOwnerProto(
   startProto: object,
   methodName: string,
 ): object | null {
   let cursor: object | null = startProto;
   let baseOwner: object | null = null;
-  while (
-    cursor &&
-    cursor !== HTMLElement.prototype &&
-    cursor !== Object.prototype
-  ) {
+  const stopProto =
+    typeof HTMLElement !== "undefined" ? HTMLElement.prototype : null;
+  while (cursor && cursor !== stopProto && cursor !== Object.prototype) {
     if (Object.hasOwn(cursor, methodName)) {
       baseOwner = cursor;
     }
@@ -253,6 +767,10 @@ export class LitReactivityTracker {
   readonly #wrappedReactiveProtos = new WeakSet<object>();
   readonly #wrappedSubclassProtos = new WeakSet<object>();
   readonly #wrappedMethods = new WeakSet<Function>();
+  readonly #origFnByWrapped = new WeakMap<
+    Function,
+    (...args: never[]) => unknown
+  >();
   readonly #wrappedMemoTargets = new WeakSet<object>();
   readonly #wrappedProviders = new WeakSet<object>();
   readonly #wrappedCallbacks = new WeakMap<Function, Function>();
@@ -265,8 +783,10 @@ export class LitReactivityTracker {
   readonly #activeLifecyclePhase = new WeakMap<object, string>();
   readonly #activeLifecycleDepth = new WeakMap<object, Map<string, number>>();
   readonly #deferredLabels = new WeakMap<object, string>();
+  readonly #ctorSourceCache = new WeakMap<object, string | null>();
   readonly #causalStack: CausalFrame[] = [];
 
+  #scanningDom = false;
   #notifyScheduled = false;
   #highlightEl: HTMLDivElement | null = null;
   #lastModelDispatch: { nodeId: number; cascadeId: number; at: number } | null =
@@ -349,6 +869,10 @@ export class LitReactivityTracker {
       const record = this.#nodesById.get(id);
       if (record && clean) {
         record.label = clean;
+        record.explicitLabel = clean;
+        record.disambiguator = null;
+        record.lockedDisambiguator = null;
+        record.lockedDisambiguatorRank = undefined;
         this.#scheduleNotify();
       }
     } else if (clean) {
@@ -369,44 +893,188 @@ export class LitReactivityTracker {
     return this.#wrapMemoField(fn, ownerNode, name, memoKind);
   }
 
+  #unwrapTargetFn(fn: unknown): ((...args: never[]) => unknown) | null {
+    if (!isCallableFn(fn)) return null;
+    let current: (...args: never[]) => unknown = fn;
+    const seen = new Set<Function>();
+    while (!seen.has(current)) {
+      seen.add(current);
+      const orig = this.#origFnByWrapped.get(current);
+      if (!orig) break;
+      current = orig;
+    }
+    return isNativeCodeFn(current) ? null : current;
+  }
+
+  getDefinitionTarget(
+    nodeId: number,
+    propName?: string | null,
+  ): ((...args: never[]) => unknown) | null {
+    const record = this.#nodesById.get(nodeId);
+    if (!record) return null;
+    const inst = record.ref.deref();
+
+    if (record.kind === "element") {
+      if (!inst || !isElement(inst)) return null;
+      const stopProto =
+        typeof HTMLElement !== "undefined" ? HTMLElement.prototype : null;
+
+      if (typeof propName === "string" && propName.length > 0) {
+        let cursor: object | null = Object.getPrototypeOf(inst);
+        while (cursor && cursor !== stopProto && cursor !== Object.prototype) {
+          const desc = Object.getOwnPropertyDescriptor(cursor, propName);
+          if (desc) {
+            const getter = this.#unwrapTargetFn(Reflect.get(desc, "get"));
+            const setter = this.#unwrapTargetFn(Reflect.get(desc, "set"));
+            if (getter && !isLitSyntheticGetter(getter)) {
+              return getter;
+            }
+            if (setter && !isLitSyntheticSetter(setter)) {
+              return setter;
+            }
+          }
+          cursor = Object.getPrototypeOf(cursor);
+        }
+
+        let basePropCtor: ((...args: never[]) => unknown) | null = null;
+        cursor = Object.getPrototypeOf(inst);
+        while (cursor && cursor !== stopProto && cursor !== Object.prototype) {
+          const cursorCtor: unknown = Reflect.get(cursor, "constructor");
+          if (isUserConstructor(cursorCtor) && !isNativeCodeFn(cursorCtor)) {
+            if (Object.hasOwn(cursorCtor, "properties")) {
+              const ownProps: unknown = Reflect.get(cursorCtor, "properties");
+              if (
+                ownProps !== null &&
+                typeof ownProps === "object" &&
+                Object.hasOwn(ownProps, propName)
+              ) {
+                return cursorCtor;
+              }
+            }
+            if (Object.hasOwn(cursorCtor, "elementProperties")) {
+              const elProps: unknown = Reflect.get(
+                cursorCtor,
+                "elementProperties",
+              );
+              if (elProps instanceof Map && elProps.has(propName)) {
+                basePropCtor = cursorCtor;
+              }
+            }
+          }
+          cursor = Object.getPrototypeOf(cursor);
+        }
+        if (basePropCtor) return basePropCtor;
+      }
+
+      const elCtor: unknown = Reflect.get(inst, "constructor");
+      return isUserConstructor(elCtor) && !isNativeCodeFn(elCtor)
+        ? elCtor
+        : null;
+    }
+
+    if (record.kind === "controller" || record.kind === "model") {
+      if (!inst) return null;
+      const ctor: unknown = Reflect.get(inst, "constructor");
+      if (isUserConstructor(ctor) && !isNativeCodeFn(ctor)) {
+        return ctor;
+      }
+      const transformFn = this.#unwrapTargetFn(Reflect.get(inst, "_transform"));
+      if (transformFn) return transformFn;
+      const updateFn = this.#unwrapTargetFn(Reflect.get(inst, "update"));
+      if (updateFn) return updateFn;
+      return null;
+    }
+
+    if (record.kind === "computed" || record.kind === "observer") {
+      const innerFn = record.innerMemoFnRef?.deref();
+      if (innerFn && isCallableFn(innerFn) && !isNativeCodeFn(innerFn)) {
+        try {
+          const src = Function.prototype.toString.call(innerFn);
+          if (!isMemoizeOneWrapperSource(src)) {
+            return innerFn;
+          }
+        } catch {
+          return innerFn;
+        }
+      }
+      if (record.ownerNodeId !== undefined) {
+        const ownerInst = this.#nodesById.get(record.ownerNodeId)?.ref.deref();
+        if (ownerInst) {
+          const ownerCtor: unknown = Reflect.get(ownerInst, "constructor");
+          if (isUserConstructor(ownerCtor) && !isNativeCodeFn(ownerCtor)) {
+            return ownerCtor;
+          }
+        }
+      }
+      return null;
+    }
+
+    if (record.kind === "context") {
+      let providerHost: object | undefined = record.providerHostRef?.deref();
+      if (!providerHost) {
+        for (const edge of this.#edges.values()) {
+          if (edge.targetId === nodeId && edge.kind === "context-provide") {
+            providerHost = this.#nodesById.get(edge.sourceId)?.ref.deref();
+            if (providerHost) break;
+          }
+        }
+      }
+      if (providerHost) {
+        const ctor: unknown = Reflect.get(providerHost, "constructor");
+        if (isUserConstructor(ctor) && !isNativeCodeFn(ctor)) {
+          return ctor;
+        }
+      }
+      return null;
+    }
+
+    return null;
+  }
+
   scanDom(): void {
     if (typeof document === "undefined" || !document.documentElement) return;
-    const visited = new Set<Node>();
-    const walk = (root: Node) => {
-      if (visited.has(root)) return;
-      visited.add(root);
+    const prevScanning = this.#scanningDom;
+    this.#scanningDom = true;
+    try {
+      const visited = new Set<Node>();
+      const walk = (root: Node) => {
+        if (visited.has(root)) return;
+        visited.add(root);
 
-      if (isElement(root)) {
-        if (typeof Reflect.get(root, "requestUpdate") === "function") {
-          const ctor: unknown = root.constructor;
-          if (typeof ctor === "function" && ctor.prototype) {
-            this.#instrumentLitClass(ctor, ctor.prototype);
+        if (isElement(root)) {
+          if (typeof Reflect.get(root, "requestUpdate") === "function") {
+            const ctor: unknown = root.constructor;
+            if (typeof ctor === "function" && ctor.prototype) {
+              this.#instrumentLitClass(ctor, ctor.prototype);
+            }
+            const record = this.#ensureElementRecord(root);
+            record.rootType = this.#resolveRootType(root);
+            this.#scanMemoFields(root, record);
+            this.#scanControllerRefsOnObject(root, record);
+            this.#scanInternalControllers(root);
           }
-          const record = this.#ensureElementRecord(root);
-          record.rootType = this.#resolveRootType(root);
-          this.#scanMemoFields(root, record);
-          this.#scanControllerRefsOnObject(root, record);
-          this.#scanInternalControllers(root);
+
+          const renderRoot: unknown = Reflect.get(root, "renderRoot");
+          const closedShadow = this.#closedShadowRoots.get(root);
+          if (isShadowRoot(renderRoot)) {
+            walk(renderRoot);
+          } else if (root.shadowRoot) {
+            walk(root.shadowRoot);
+          } else if (closedShadow) {
+            walk(closedShadow);
+          }
         }
 
-        const renderRoot: unknown = Reflect.get(root, "renderRoot");
-        const closedShadow = this.#closedShadowRoots.get(root);
-        if (isShadowRoot(renderRoot)) {
-          walk(renderRoot);
-        } else if (root.shadowRoot) {
-          walk(root.shadowRoot);
-        } else if (closedShadow) {
-          walk(closedShadow);
+        const children = root.childNodes;
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          if (child) walk(child);
         }
-      }
-
-      const children = root.childNodes;
-      for (let i = 0; i < children.length; i++) {
-        const child = children[i];
-        if (child) walk(child);
-      }
-    };
-    walk(document.documentElement);
+      };
+      walk(document.documentElement);
+    } finally {
+      this.#scanningDom = prevScanning;
+    }
   }
 
   configure(settings: Partial<HookSettings>): void {
@@ -571,7 +1239,7 @@ export class LitReactivityTracker {
   }
 
   snapshot(sinceSeq?: number): GraphSnapshot {
-    const nodes: ReactivityNodeSnapshot[] = [];
+    const liveRecords: NodeRecord[] = [];
     const liveIds = new Set<number>();
 
     for (const [id, record] of this.#nodesById.entries()) {
@@ -584,6 +1252,8 @@ export class LitReactivityTracker {
       if (record.kind === "element" && isElement(inst)) {
         record.connected = inst.isConnected;
         record.rootType = this.#resolveRootType(inst);
+        record.tagName = inst.tagName.toLowerCase();
+        record.domParentNodeId = this.#resolveDomParentNodeId(inst);
         this.#refreshElementPropertyValues(record, inst);
       } else if (
         (record.kind === "computed" ||
@@ -611,6 +1281,25 @@ export class LitReactivityTracker {
       }
 
       liveIds.add(id);
+      liveRecords.push(record);
+    }
+
+    this.#resolveCohortDisambiguators(liveRecords);
+
+    // Keep memo subtitles synced with disambiguated owner labels
+    for (const record of liveRecords) {
+      if (
+        (record.kind === "computed" || record.kind === "observer") &&
+        record.ownerNodeId !== undefined
+      ) {
+        const owner = this.#nodesById.get(record.ownerNodeId);
+        if (owner) {
+          record.subtitle = owner.label;
+        }
+      }
+    }
+
+    const nodes: ReactivityNodeSnapshot[] = liveRecords.map((record) => {
       const propList: ReactivePropertySnapshot[] | undefined = record.properties
         ? Array.from(record.properties.values()).map((p) => ({
             name: p.name,
@@ -626,7 +1315,7 @@ export class LitReactivityTracker {
           }))
         : undefined;
 
-      nodes.push({
+      return {
         id: record.id,
         kind: record.kind,
         label: record.label,
@@ -646,8 +1335,24 @@ export class LitReactivityTracker {
         ...(record.rootType ? { rootType: record.rootType } : {}),
         ...(propList ? { properties: propList } : {}),
         ...(record.lastArgs ? { lastArgs: record.lastArgs } : {}),
-      });
-    }
+        ...(record.ownerNodeId !== undefined
+          ? { ownerNodeId: record.ownerNodeId }
+          : {}),
+        ...(record.domParentNodeId !== undefined
+          ? { domParentNodeId: record.domParentNodeId }
+          : {}),
+        ...(record.tagName !== undefined ? { tagName: record.tagName } : {}),
+        ...(record.disambiguator !== undefined
+          ? { disambiguator: record.disambiguator }
+          : {}),
+        ...(record.computeSource !== undefined
+          ? { computeSource: record.computeSource }
+          : {}),
+        ...(record.computeSignature !== undefined
+          ? { computeSignature: record.computeSignature }
+          : {}),
+      };
+    });
 
     const edges: ReactivityEdgeSnapshot[] = [];
     for (const [edgeId, edge] of this.#edges.entries()) {
@@ -688,6 +1393,366 @@ export class LitReactivityTracker {
       edges,
       events,
     };
+  }
+
+  #resolveDomParentNodeId(element: Element): number | undefined {
+    let cursor: Node | null = element.parentNode;
+    let depth = 0;
+    while (cursor && depth < 512) {
+      depth++;
+      if (isElement(cursor)) {
+        const existingId = this.#idByObject.get(cursor);
+        if (existingId !== undefined) {
+          return existingId;
+        }
+        if (typeof Reflect.get(cursor, "requestUpdate") === "function") {
+          return this.#ensureElementRecord(cursor).id;
+        }
+      }
+      cursor = isShadowRoot(cursor) ? cursor.host : cursor.parentNode;
+    }
+    return undefined;
+  }
+
+  #resolveCohortDisambiguators(liveRecords: ReadonlyArray<NodeRecord>): void {
+    interface CohortMember {
+      readonly record: NodeRecord;
+      readonly el: Element;
+      readonly tagName: string;
+      resolved: boolean;
+      disambiguator: string | null;
+      rank: number;
+    }
+
+    const cohorts = new Map<string, CohortMember[]>();
+    for (const record of liveRecords) {
+      if (record.kind !== "element") continue;
+      const inst = record.ref.deref();
+      if (!inst || !isElement(inst)) continue;
+      const tagName = record.tagName ?? inst.tagName.toLowerCase();
+      record.tagName = tagName;
+      const list = cohorts.get(tagName);
+      const member: CohortMember = {
+        record,
+        el: inst,
+        tagName,
+        resolved: false,
+        disambiguator: null,
+        rank: 6,
+      };
+      if (list) {
+        list.push(member);
+      } else {
+        cohorts.set(tagName, [member]);
+      }
+    }
+
+    const applyMemberLabel = (member: CohortMember): void => {
+      const { record, tagName, disambiguator, rank, el } = member;
+      if (record.explicitLabel) {
+        record.disambiguator = null;
+        record.label = record.explicitLabel;
+        return;
+      }
+      if (!disambiguator) {
+        record.disambiguator = null;
+        record.label = tagName;
+        return;
+      }
+      const hasUpdated =
+        record.updates >= 1 || Boolean(Reflect.get(el, "hasUpdated"));
+      if (rank >= 1 && rank <= 5 && hasUpdated && !record.lockedDisambiguator) {
+        record.lockedDisambiguator = disambiguator;
+        record.lockedDisambiguatorRank = rank;
+      }
+      record.disambiguator = disambiguator;
+      record.label = disambiguator.startsWith("#")
+        ? `${tagName}${disambiguator}`
+        : `${tagName} ${disambiguator}`;
+    };
+
+    for (const [tagName, members] of cohorts.entries()) {
+      if (members.length === 1) {
+        const only = members[0]!;
+        if (only.record.explicitLabel) {
+          only.rank = 0;
+          applyMemberLabel(only);
+          continue;
+        }
+        const domId = (only.el.id ?? "").trim();
+        if (domId.length > 0) {
+          only.disambiguator = `#${domId}`;
+          only.rank = 1;
+          only.resolved = true;
+        } else {
+          only.disambiguator = null;
+          only.rank = 0;
+        }
+        applyMemberLabel(only);
+        continue;
+      }
+
+      const usedDisambiguators = new Set<string>();
+
+      // Tier 0 (explicit hook.label) and latched Ranks 1-5
+      for (const m of members) {
+        if (m.record.explicitLabel) {
+          m.resolved = true;
+          m.rank = 0;
+          continue;
+        }
+        if (m.record.lockedDisambiguator) {
+          m.resolved = true;
+          m.disambiguator = m.record.lockedDisambiguator;
+          m.rank = m.record.lockedDisambiguatorRank ?? 1;
+          usedDisambiguators.add(m.record.lockedDisambiguator);
+        }
+      }
+
+      // Tier 1: #id (unique within cohort, since Shadow DOM roots can reuse ids)
+      const idCandidates = new Map<CohortMember, string>();
+      const idCounts = new Map<string, number>();
+      for (const m of members) {
+        const domId = (m.el.id ?? "").trim();
+        if (domId.length > 0) {
+          const d = `#${domId}`;
+          idCandidates.set(m, d);
+          idCounts.set(d, (idCounts.get(d) ?? 0) + 1);
+        }
+      }
+      for (const m of members) {
+        if (m.resolved) continue;
+        const cand = idCandidates.get(m);
+        if (!cand) continue;
+        if (idCounts.get(cand) === 1 && !usedDisambiguators.has(cand)) {
+          m.resolved = true;
+          m.disambiguator = cand;
+          m.rank = 1;
+          usedDisambiguators.add(cand);
+        }
+      }
+
+      // Tier 2: data-testid/data-test-id/data-id -> slot/name (if distinct) -> aria-label/title
+      const resolveDistinctAttr = (attrs: ReadonlyArray<string>): void => {
+        for (const attr of attrs) {
+          const candidates = new Map<CohortMember, string>();
+          const counts = new Map<string, number>();
+          for (const m of members) {
+            const raw =
+              typeof m.el.getAttribute === "function"
+                ? m.el.getAttribute(attr)?.trim()
+                : undefined;
+            if (!raw) continue;
+            const formatted = `[${attr}="${truncateLabelText(raw)}"]`;
+            candidates.set(m, formatted);
+            counts.set(formatted, (counts.get(formatted) ?? 0) + 1);
+          }
+          for (const m of members) {
+            if (m.resolved) continue;
+            const cand = candidates.get(m);
+            if (!cand) continue;
+            if (counts.get(cand) === 1 && !usedDisambiguators.has(cand)) {
+              m.resolved = true;
+              m.disambiguator = cand;
+              m.rank = 2;
+              usedDisambiguators.add(cand);
+            }
+          }
+        }
+      };
+
+      resolveDistinctAttr(["data-testid", "data-test-id", "data-id"]);
+      resolveDistinctAttr(["slot", "name"]);
+      resolveDistinctAttr(["aria-label", "title"]);
+
+      // Tier 3: entropy-ranked low-churn primitive reactive prop
+      while (members.some((m) => !m.resolved)) {
+        let bestProp: {
+          readonly uniqueCount: number;
+          readonly entropy: number;
+          readonly maxChanges: number;
+          readonly prioIdx: number;
+          readonly winners: ReadonlyArray<readonly [CohortMember, string]>;
+        } | null = null;
+
+        for (
+          let prioIdx = 0;
+          prioIdx < DISAMBIGUATOR_PROP_PRIORITY.length;
+          prioIdx++
+        ) {
+          const propName = DISAMBIGUATOR_PROP_PRIORITY[prioIdx]!;
+          const allValues = new Map<CohortMember, string>();
+          const allCounts = new Map<string, number>();
+          const unresolvedCounts = new Map<string, number>();
+          const memberChanges = new Map<CohortMember, number>();
+          let unresolvedWithProp = 0;
+
+          for (const m of members) {
+            const propRec = m.record.properties?.get(propName);
+            const hasDeclaredProp = propRec !== undefined;
+            if (!hasDeclaredProp) continue;
+            const read = safeReadProp(m.el, propName);
+            if (!read.ok) continue;
+            const val = read.value;
+            let formatted: string | null = null;
+            if (typeof val === "string") {
+              const trimmed = val.trim();
+              if (trimmed.length > 0) {
+                formatted = `${propName}="${truncateLabelText(trimmed)}"`;
+              }
+            } else if (typeof val === "number" && Number.isFinite(val)) {
+              formatted = `${propName}=${String(val)}`;
+            } else if (typeof val === "boolean") {
+              formatted = `${propName}=${String(val)}`;
+            }
+            if (!formatted) continue;
+            allValues.set(m, formatted);
+            allCounts.set(formatted, (allCounts.get(formatted) ?? 0) + 1);
+            memberChanges.set(m, propRec.changes);
+            if (!m.resolved) {
+              unresolvedWithProp++;
+              unresolvedCounts.set(
+                formatted,
+                (unresolvedCounts.get(formatted) ?? 0) + 1,
+              );
+            }
+          }
+
+          if (unresolvedWithProp === 0) continue;
+
+          const winners: Array<readonly [CohortMember, string]> = [];
+          let maxChanges = 0;
+          for (const m of members) {
+            if (m.resolved) continue;
+            const cand = allValues.get(m);
+            if (!cand) continue;
+            const changes = memberChanges.get(m) ?? 0;
+            if (changes > 3) continue;
+            if (allCounts.get(cand) === 1 && !usedDisambiguators.has(cand)) {
+              winners.push([m, cand]);
+              if (changes > maxChanges) maxChanges = changes;
+            }
+          }
+
+          if (winners.length === 0) continue;
+
+          let entropy = 0;
+          for (const count of unresolvedCounts.values()) {
+            const p = count / unresolvedWithProp;
+            if (p > 0) entropy -= p * Math.log2(p);
+          }
+
+          const isBetter =
+            !bestProp ||
+            winners.length > bestProp.uniqueCount ||
+            (winners.length === bestProp.uniqueCount &&
+              (entropy > bestProp.entropy + 1e-6 ||
+                (Math.abs(entropy - bestProp.entropy) <= 1e-6 &&
+                  (maxChanges < bestProp.maxChanges ||
+                    (maxChanges === bestProp.maxChanges &&
+                      prioIdx < bestProp.prioIdx)))));
+
+          if (isBetter) {
+            bestProp = {
+              uniqueCount: winners.length,
+              entropy,
+              maxChanges,
+              prioIdx,
+              winners,
+            };
+          }
+        }
+
+        if (!bestProp) break;
+        for (const [m, cand] of bestProp.winners) {
+          m.resolved = true;
+          m.disambiguator = cand;
+          m.rank = 3;
+          usedDisambiguators.add(cand);
+        }
+      }
+
+      // Tier 4: short leaf textContent / shadow button label
+      if (members.some((m) => !m.resolved)) {
+        const textCands = new Map<CohortMember, string>();
+        const textCounts = new Map<string, number>();
+        for (const m of members) {
+          const shortText = extractElementShortText(
+            m.el,
+            this.#closedShadowRoots.get(m.el),
+          );
+          if (!shortText) continue;
+          const formatted = `"${shortText}"`;
+          textCands.set(m, formatted);
+          textCounts.set(formatted, (textCounts.get(formatted) ?? 0) + 1);
+        }
+        for (const m of members) {
+          if (m.resolved) continue;
+          const cand = textCands.get(m);
+          if (!cand) continue;
+          if (textCounts.get(cand) === 1 && !usedDisambiguators.has(cand)) {
+            m.resolved = true;
+            m.disambiguator = cand;
+            m.rank = 4;
+            usedDisambiguators.add(cand);
+          }
+        }
+      }
+
+      // Tier 5: distinct domParentNodeId tag (in <parent>)
+      if (members.some((m) => !m.resolved)) {
+        const parentCands = new Map<CohortMember, string>();
+        const parentCounts = new Map<string, number>();
+        for (const m of members) {
+          const parentId = m.record.domParentNodeId;
+          if (parentId === undefined) continue;
+          const parentRecord = this.#nodesById.get(parentId);
+          const parentTag =
+            parentRecord?.tagName ?? parentRecord?.label ?? null;
+          if (!parentTag) continue;
+          const formatted = `in ${parentTag}`;
+          parentCands.set(m, formatted);
+          parentCounts.set(formatted, (parentCounts.get(formatted) ?? 0) + 1);
+        }
+        for (const m of members) {
+          if (m.resolved) continue;
+          const cand = parentCands.get(m);
+          if (!cand) continue;
+          if (parentCounts.get(cand) === 1 && !usedDisambiguators.has(cand)) {
+            m.resolved = true;
+            m.disambiguator = cand;
+            m.rank = 5;
+            usedDisambiguators.add(cand);
+          }
+        }
+      }
+
+      // Tier 6: DOM sibling ordinal [1]..[n] (never latched)
+      const remaining = members.filter((m) => !m.resolved);
+      if (remaining.length > 0) {
+        remaining.sort((a, b) =>
+          compareDomOrder(a.el, b.el, a.record.id, b.record.id),
+        );
+        let ordinal = 1;
+        for (const m of remaining) {
+          while (usedDisambiguators.has(`[${ordinal}]`)) {
+            ordinal++;
+          }
+          const cand = `[${ordinal}]`;
+          m.resolved = true;
+          m.disambiguator = cand;
+          m.rank = 6;
+          usedDisambiguators.add(cand);
+          ordinal++;
+        }
+      }
+
+      for (const m of members) {
+        applyMemberLabel(m);
+        // Ensure record.tagName remains bare lowercase tag
+        m.record.tagName = tagName;
+      }
+    }
   }
 
   #measureElementRect(
@@ -757,21 +1822,27 @@ export class LitReactivityTracker {
     const origAttach: unknown = Reflect.get(proto, "attachShadow");
     if (typeof origAttach !== "function") return;
 
-    const wrappedAttach = new Proxy(origAttach, {
-      apply: (target, thisArg, argArray) => {
-        const root: unknown = Reflect.apply(target, thisArg, argArray);
-        if (isElement(thisArg) && isShadowRoot(root)) {
-          const init: unknown = argArray[0];
-          if (
-            init !== null &&
-            typeof init === "object" &&
-            Reflect.get(init, "mode") === "closed"
-          ) {
-            this.#closedShadowRoots.set(thisArg, root);
-          }
+    const __LIT_DEVTOOLS__attachShadow = (
+      target: Function,
+      thisArg: unknown,
+      argArray: unknown[],
+    ): unknown => {
+      const root: unknown = Reflect.apply(target, thisArg, argArray);
+      if (isElement(thisArg) && isShadowRoot(root)) {
+        const init: unknown = argArray[0];
+        if (
+          init !== null &&
+          typeof init === "object" &&
+          Reflect.get(init, "mode") === "closed"
+        ) {
+          this.#closedShadowRoots.set(thisArg, root);
         }
-        return root;
-      },
+      }
+      return root;
+    };
+
+    const wrappedAttach = new Proxy(origAttach, {
+      apply: __LIT_DEVTOOLS__attachShadow,
     });
     Reflect.set(proto, "attachShadow", wrappedAttach);
   }
@@ -785,24 +1856,30 @@ export class LitReactivityTracker {
     const origDefine: unknown = Reflect.get(regProto, "define");
     if (typeof origDefine !== "function") return;
 
-    const wrappedDefine = new Proxy(origDefine, {
-      apply: (target, thisArg, argArray) => {
-        const constructor: unknown = argArray[1];
-        try {
-          if (typeof constructor === "function" && constructor.prototype) {
-            const site = captureCallsite(2);
-            if (site) {
-              this.#defineSites.set(constructor, site);
-            }
-            if (isReactiveElementProto(constructor.prototype)) {
-              this.#instrumentLitClass(constructor, constructor.prototype);
-            }
+    const __LIT_DEVTOOLS__wrappedDefine = (
+      target: Function,
+      thisArg: unknown,
+      argArray: unknown[],
+    ): unknown => {
+      const constructor: unknown = argArray[1];
+      try {
+        if (typeof constructor === "function" && constructor.prototype) {
+          const site = captureCallsite(0);
+          if (site) {
+            this.#defineSites.set(constructor, site);
           }
-        } catch {
-          // Never interfere with customElements.define registration
+          if (isReactiveElementProto(constructor.prototype)) {
+            this.#instrumentLitClass(constructor, constructor.prototype);
+          }
         }
-        return Reflect.apply(target, thisArg, argArray);
-      },
+      } catch {
+        // Never interfere with customElements.define registration
+      }
+      return Reflect.apply(target, thisArg, argArray);
+    };
+
+    const wrappedDefine = new Proxy(origDefine, {
+      apply: __LIT_DEVTOOLS__wrappedDefine,
     });
     Reflect.set(regProto, "define", wrappedDefine);
   }
@@ -818,12 +1895,10 @@ export class LitReactivityTracker {
     }
 
     // Wrap every prototype from subProto up to HTMLElement.prototype (including SignalWatcher/LitElement/ReactiveElement)
+    const stopProto =
+      typeof HTMLElement !== "undefined" ? HTMLElement.prototype : null;
     let cursor: object | null = subProto;
-    while (
-      cursor &&
-      cursor !== HTMLElement.prototype &&
-      cursor !== Object.prototype
-    ) {
+    while (cursor && cursor !== stopProto && cursor !== Object.prototype) {
       if (!this.#wrappedSubclassProtos.has(cursor)) {
         this.#wrappedSubclassProtos.add(cursor);
         this.#wrapSubclassHooks(cursor);
@@ -831,8 +1906,8 @@ export class LitReactivityTracker {
       cursor = Object.getPrototypeOf(cursor);
     }
 
-    if (!this.#defineSites.has(ctor)) {
-      const fallbackSite = captureCallsite(2);
+    if (!this.#scanningDom && !this.#defineSites.has(ctor)) {
+      const fallbackSite = captureCallsite(0);
       if (fallbackSite) this.#defineSites.set(ctor, fallbackSite);
     }
   }
@@ -846,19 +1921,24 @@ export class LitReactivityTracker {
       typeof origAddController === "function" &&
       !this.#wrappedMethods.has(origAddController)
     ) {
+      const __LIT_DEVTOOLS__addController = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        const controller: unknown = argArray[0];
+        if (
+          thisArg !== null &&
+          typeof thisArg === "object" &&
+          controller !== null &&
+          typeof controller === "object"
+        ) {
+          this.#onControllerAdded(thisArg, controller);
+        }
+        return Reflect.apply(target, thisArg, argArray);
+      };
       const wrappedAdd = new Proxy(origAddController, {
-        apply: (target, thisArg, argArray) => {
-          const controller: unknown = argArray[0];
-          if (
-            thisArg !== null &&
-            typeof thisArg === "object" &&
-            controller !== null &&
-            typeof controller === "object"
-          ) {
-            this.#onControllerAdded(thisArg, controller);
-          }
-          return Reflect.apply(target, thisArg, argArray);
-        },
+        apply: __LIT_DEVTOOLS__addController,
       });
       this.#wrappedMethods.add(wrappedAdd);
       Reflect.set(reactiveProto, "addController", wrappedAdd);
@@ -872,36 +1952,41 @@ export class LitReactivityTracker {
       typeof origRemoveController === "function" &&
       !this.#wrappedMethods.has(origRemoveController)
     ) {
-      const wrappedRemove = new Proxy(origRemoveController, {
-        apply: (target, thisArg, argArray) => {
-          const controller: unknown = argArray[0];
-          if (
-            thisArg !== null &&
-            typeof thisArg === "object" &&
-            controller !== null &&
-            typeof controller === "object"
-          ) {
-            this.#controllersByHost.get(thisArg)?.delete(controller);
-            const ctrlId = this.#idByObject.get(controller);
-            const hostId = this.#idByObject.get(thisArg);
-            if (ctrlId !== undefined) {
-              const ctrlNode = this.#nodesById.get(ctrlId);
-              if (ctrlNode) ctrlNode.connected = false;
-              if (hostId !== undefined) {
-                for (const [edgeId, edge] of this.#edges.entries()) {
-                  if (
-                    edge.sourceId === ctrlId &&
-                    edge.targetId === hostId &&
-                    edge.kind === "controller-to-element"
-                  ) {
-                    this.#edges.delete(edgeId);
-                  }
+      const __LIT_DEVTOOLS__removeController = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        const controller: unknown = argArray[0];
+        if (
+          thisArg !== null &&
+          typeof thisArg === "object" &&
+          controller !== null &&
+          typeof controller === "object"
+        ) {
+          this.#controllersByHost.get(thisArg)?.delete(controller);
+          const ctrlId = this.#idByObject.get(controller);
+          const hostId = this.#idByObject.get(thisArg);
+          if (ctrlId !== undefined) {
+            const ctrlNode = this.#nodesById.get(ctrlId);
+            if (ctrlNode) ctrlNode.connected = false;
+            if (hostId !== undefined) {
+              for (const [edgeId, edge] of this.#edges.entries()) {
+                if (
+                  edge.sourceId === ctrlId &&
+                  edge.targetId === hostId &&
+                  edge.kind === "controller-to-element"
+                ) {
+                  this.#edges.delete(edgeId);
                 }
               }
             }
           }
-          return Reflect.apply(target, thisArg, argArray);
-        },
+        }
+        return Reflect.apply(target, thisArg, argArray);
+      };
+      const wrappedRemove = new Proxy(origRemoveController, {
+        apply: __LIT_DEVTOOLS__removeController,
       });
       this.#wrappedMethods.add(wrappedRemove);
       Reflect.set(reactiveProto, "removeController", wrappedRemove);
@@ -915,31 +2000,36 @@ export class LitReactivityTracker {
       typeof origRequestUpdate === "function" &&
       !this.#wrappedMethods.has(origRequestUpdate)
     ) {
+      const __LIT_DEVTOOLS__requestUpdate = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        if (isElement(thisArg)) {
+          const rawName: unknown = argArray[0];
+          const name: PropertyKey | undefined =
+            typeof rawName === "string" ||
+            typeof rawName === "number" ||
+            typeof rawName === "symbol"
+              ? rawName
+              : undefined;
+          const oldValue: unknown = argArray[1];
+          const options: unknown = argArray[2];
+          const useNewValue = Boolean(argArray[3]);
+          const newValue: unknown = argArray[4];
+          this.#onElementRequestUpdate(
+            thisArg,
+            name,
+            oldValue,
+            options,
+            useNewValue,
+            newValue,
+          );
+        }
+        return Reflect.apply(target, thisArg, argArray);
+      };
       const wrappedRequestUpdate = new Proxy(origRequestUpdate, {
-        apply: (target, thisArg, argArray) => {
-          if (isElement(thisArg)) {
-            const rawName: unknown = argArray[0];
-            const name: PropertyKey | undefined =
-              typeof rawName === "string" ||
-              typeof rawName === "number" ||
-              typeof rawName === "symbol"
-                ? rawName
-                : undefined;
-            const oldValue: unknown = argArray[1];
-            const options: unknown = argArray[2];
-            const useNewValue = Boolean(argArray[3]);
-            const newValue: unknown = argArray[4];
-            this.#onElementRequestUpdate(
-              thisArg,
-              name,
-              oldValue,
-              options,
-              useNewValue,
-              newValue,
-            );
-          }
-          return Reflect.apply(target, thisArg, argArray);
-        },
+        apply: __LIT_DEVTOOLS__requestUpdate,
       });
       this.#wrappedMethods.add(wrappedRequestUpdate);
       Reflect.set(reactiveProto, "requestUpdate", wrappedRequestUpdate);
@@ -953,69 +2043,74 @@ export class LitReactivityTracker {
       typeof origPerformUpdate === "function" &&
       !this.#wrappedMethods.has(origPerformUpdate)
     ) {
-      const wrappedPerformUpdate = new Proxy(origPerformUpdate, {
-        apply: (target, thisArg, argArray) => {
-          if (!isElement(thisArg)) {
-            return Reflect.apply(target, thisArg, argArray);
-          }
-          const record = this.#ensureElementRecord(thisArg);
-          record.rootType = this.#resolveRootType(thisArg);
-          this.#scanMemoFields(thisArg, record);
-          this.#scanControllerRefsOnObject(thisArg, record);
-          this.#scanInternalControllers(thisArg);
+      const __LIT_DEVTOOLS__performUpdate = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        if (!isElement(thisArg)) {
+          return Reflect.apply(target, thisArg, argArray);
+        }
+        const record = this.#ensureElementRecord(thisArg);
+        record.rootType = this.#resolveRootType(thisArg);
+        this.#scanMemoFields(thisArg, record);
+        this.#scanControllerRefsOnObject(thisArg, record);
+        this.#scanInternalControllers(thisArg);
 
-          const pending = this.#pendingCauses.get(thisArg);
-          if (pending) {
-            this.#pendingCauses.delete(thisArg);
-            record.lastCauseNodeId = pending.causeNodeId;
-            record.lastCauseLabel = pending.label;
-          } else {
-            record.lastCauseNodeId = null;
-            record.lastCauseLabel = null;
-          }
-          const cascadeId = pending?.cascadeId ?? this.#nextCascadeId++;
+        const pending = this.#pendingCauses.get(thisArg);
+        if (pending) {
+          this.#pendingCauses.delete(thisArg);
+          record.lastCauseNodeId = pending.causeNodeId;
+          record.lastCauseLabel = pending.label;
+        } else {
+          record.lastCauseNodeId = null;
+          record.lastCauseLabel = null;
+        }
+        const cascadeId = pending?.cascadeId ?? this.#nextCascadeId++;
 
-          this.#causalStack.push({
-            nodeId: record.id,
-            kind: "element",
-            label: record.label,
+        this.#causalStack.push({
+          nodeId: record.id,
+          kind: "element",
+          label: record.label,
+          cascadeId,
+          phase: "performUpdate",
+        });
+
+        const onPerformError = (err: unknown) => {
+          record.error = formatErrorMessage(err);
+          this.#pushTrace({
             cascadeId,
-            phase: "performUpdate",
+            durationMs: 0,
+            nodeId: record.id,
+            kind: "error",
+            label: `${record.label} performUpdate error`,
+            causeNodeId: record.lastCauseNodeId,
+            detail: record.error,
           });
+          this.#scheduleNotify();
+        };
 
-          const onPerformError = (err: unknown) => {
-            record.error = formatErrorMessage(err);
-            this.#pushTrace({
-              cascadeId,
-              durationMs: 0,
-              nodeId: record.id,
-              kind: "error",
-              label: `${record.label} performUpdate error`,
-              causeNodeId: record.lastCauseNodeId,
-              detail: record.error,
-            });
-            this.#scheduleNotify();
-          };
-
-          try {
-            const ret: unknown = Reflect.apply(target, thisArg, argArray);
-            if (isPromiseLike(ret)) {
-              return ret.then(
-                (val) => val,
-                (err: unknown) => {
-                  onPerformError(err);
-                  throw err;
-                },
-              );
-            }
-            return ret;
-          } catch (err) {
-            onPerformError(err);
-            throw err;
-          } finally {
-            this.#causalStack.pop();
+        try {
+          const ret: unknown = Reflect.apply(target, thisArg, argArray);
+          if (isPromiseLike(ret)) {
+            return ret.then(
+              (val) => val,
+              (err: unknown) => {
+                onPerformError(err);
+                throw err;
+              },
+            );
           }
-        },
+          return ret;
+        } catch (err) {
+          onPerformError(err);
+          throw err;
+        } finally {
+          this.#causalStack.pop();
+        }
+      };
+      const wrappedPerformUpdate = new Proxy(origPerformUpdate, {
+        apply: __LIT_DEVTOOLS__performUpdate,
       });
       this.#wrappedMethods.add(wrappedPerformUpdate);
       Reflect.set(reactiveProto, "performUpdate", wrappedPerformUpdate);
@@ -1043,132 +2138,141 @@ export class LitReactivityTracker {
       if (!desc.writable && !desc.configurable) return;
 
       const origFn: Function = desc.value;
-      const wrapped = new Proxy(origFn, {
-        apply: (target, thisArg, argArray) => {
-          if (!isElement(thisArg)) {
-            return Reflect.apply(target, thisArg, argArray);
+      const __LIT_DEVTOOLS__lifecycle = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        if (!isElement(thisArg)) {
+          return Reflect.apply(target, thisArg, argArray);
+        }
+
+        let depthMap = this.#activeLifecycleDepth.get(thisArg);
+        if (!depthMap) {
+          depthMap = new Map<string, number>();
+          this.#activeLifecycleDepth.set(thisArg, depthMap);
+        }
+        const depth = depthMap.get(methodName) ?? 0;
+        depthMap.set(methodName, depth + 1);
+        const isOutermost = depth === 0;
+
+        const record = this.#ensureElementRecord(thisArg);
+        const prevPhase = this.#activeLifecyclePhase.get(thisArg);
+        if (isOutermost) {
+          this.#activeLifecyclePhase.set(thisArg, methodName);
+        }
+
+        const startMs = performance.now();
+        let reservedRenderEvent: TraceEvent | null = null;
+        let pushedUpdateFrame = false;
+
+        try {
+          if (isOutermost && methodName === "connectedCallback") {
+            record.connected = true;
+            record.rootType = this.#resolveRootType(thisArg);
+            this.#scanMemoFields(thisArg, record);
+            this.#scanControllerRefsOnObject(thisArg, record);
+            this.#scanInternalControllers(thisArg);
+            this.#pushTrace({
+              cascadeId: this.#currentCascadeId(),
+              durationMs: 0,
+              nodeId: record.id,
+              kind: "connect",
+              label: `${record.label} connected`,
+              causeNodeId: null,
+              detail: null,
+            });
+            this.#scheduleNotify();
+          } else if (isOutermost && methodName === "disconnectedCallback") {
+            record.connected = false;
+            this.#scheduleNotify();
+          } else if (
+            isOutermost &&
+            (methodName === "willUpdate" || methodName === "update")
+          ) {
+            const changed = argArray[0];
+            if (changed instanceof Map) {
+              this.#syncChangedPropertiesMap(record, thisArg, changed);
+            }
           }
 
-          let depthMap = this.#activeLifecycleDepth.get(thisArg);
-          if (!depthMap) {
-            depthMap = new Map<string, number>();
-            this.#activeLifecycleDepth.set(thisArg, depthMap);
+          if (isOutermost && methodName === "update") {
+            const cascadeId = this.#currentCascadeId();
+            reservedRenderEvent = this.#pushTraceMutable({
+              cascadeId,
+              durationMs: 0,
+              nodeId: record.id,
+              kind: "render",
+              label: `${record.label} render`,
+              causeNodeId: record.lastCauseNodeId,
+              detail: record.lastCauseLabel,
+            });
+            // Push update phase onto causalStack in case a subclass calls update() directly outside performUpdate
+            this.#causalStack.push({
+              nodeId: record.id,
+              kind: "element",
+              label: record.label,
+              cascadeId,
+              phase: "update",
+            });
+            pushedUpdateFrame = true;
           }
-          const depth = depthMap.get(methodName) ?? 0;
-          depthMap.set(methodName, depth + 1);
-          const isOutermost = depth === 0;
 
-          const record = this.#ensureElementRecord(thisArg);
-          const prevPhase = this.#activeLifecyclePhase.get(thisArg);
+          const result: unknown = Reflect.apply(target, thisArg, argArray);
+
+          if (
+            isOutermost &&
+            methodName === "shouldUpdate" &&
+            result === false
+          ) {
+            record.vetoes += 1;
+            this.#pushTrace({
+              cascadeId: this.#currentCascadeId(),
+              durationMs: performance.now() - startMs,
+              nodeId: record.id,
+              kind: "veto",
+              label: `${record.label} shouldUpdate → false`,
+              causeNodeId: record.lastCauseNodeId,
+              detail: "Render skipped by shouldUpdate",
+            });
+            this.#scheduleNotify();
+          } else if (isOutermost && methodName === "update") {
+            const durationMs = performance.now() - startMs;
+            record.updates += 1;
+            record.lastDurationMs = durationMs;
+            record.error = null;
+            record.rootType = this.#resolveRootType(thisArg);
+            if (reservedRenderEvent) {
+              record.lastChangedSeq = reservedRenderEvent.seq;
+              this.#patchTraceDuration(reservedRenderEvent.seq, durationMs);
+            }
+            this.#scheduleNotify();
+          }
+
+          return result;
+        } finally {
+          if (pushedUpdateFrame) {
+            this.#causalStack.pop();
+          }
+          depthMap.set(methodName, depth);
           if (isOutermost) {
-            this.#activeLifecyclePhase.set(thisArg, methodName);
-          }
-
-          const startMs = performance.now();
-          let reservedRenderEvent: TraceEvent | null = null;
-          let pushedUpdateFrame = false;
-
-          try {
-            if (isOutermost && methodName === "connectedCallback") {
-              record.connected = true;
-              record.rootType = this.#resolveRootType(thisArg);
-              this.#scanMemoFields(thisArg, record);
-              this.#scanControllerRefsOnObject(thisArg, record);
-              this.#scanInternalControllers(thisArg);
-              this.#pushTrace({
-                cascadeId: this.#currentCascadeId(),
-                durationMs: 0,
-                nodeId: record.id,
-                kind: "connect",
-                label: `${record.label} connected`,
-                causeNodeId: null,
-                detail: null,
-              });
-              this.#scheduleNotify();
-            } else if (isOutermost && methodName === "disconnectedCallback") {
-              record.connected = false;
-              this.#scheduleNotify();
-            } else if (
-              isOutermost &&
-              (methodName === "willUpdate" || methodName === "update")
-            ) {
-              const changed = argArray[0];
-              if (changed instanceof Map) {
-                this.#syncChangedPropertiesMap(record, thisArg, changed);
-              }
-            }
-
-            if (isOutermost && methodName === "update") {
-              const cascadeId = this.#currentCascadeId();
-              reservedRenderEvent = this.#pushTraceMutable({
-                cascadeId,
-                durationMs: 0,
-                nodeId: record.id,
-                kind: "render",
-                label: `${record.label} render`,
-                causeNodeId: record.lastCauseNodeId,
-                detail: record.lastCauseLabel,
-              });
-              // Push update phase onto causalStack in case a subclass calls update() directly outside performUpdate
-              this.#causalStack.push({
-                nodeId: record.id,
-                kind: "element",
-                label: record.label,
-                cascadeId,
-                phase: "update",
-              });
-              pushedUpdateFrame = true;
-            }
-
-            const result: unknown = Reflect.apply(target, thisArg, argArray);
-
-            if (
-              isOutermost &&
-              methodName === "shouldUpdate" &&
-              result === false
-            ) {
-              record.vetoes += 1;
-              this.#pushTrace({
-                cascadeId: this.#currentCascadeId(),
-                durationMs: performance.now() - startMs,
-                nodeId: record.id,
-                kind: "veto",
-                label: `${record.label} shouldUpdate → false`,
-                causeNodeId: record.lastCauseNodeId,
-                detail: "Render skipped by shouldUpdate",
-              });
-              this.#scheduleNotify();
-            } else if (isOutermost && methodName === "update") {
-              const durationMs = performance.now() - startMs;
-              record.updates += 1;
-              record.lastDurationMs = durationMs;
-              record.error = null;
-              record.rootType = this.#resolveRootType(thisArg);
-              if (reservedRenderEvent) {
-                record.lastChangedSeq = reservedRenderEvent.seq;
-                this.#patchTraceDuration(reservedRenderEvent.seq, durationMs);
-              }
-              this.#scheduleNotify();
-            }
-
-            return result;
-          } finally {
-            if (pushedUpdateFrame) {
-              this.#causalStack.pop();
-            }
-            depthMap.set(methodName, depth);
-            if (isOutermost) {
-              if (prevPhase !== undefined) {
-                this.#activeLifecyclePhase.set(thisArg, prevPhase);
-              } else {
-                this.#activeLifecyclePhase.delete(thisArg);
-              }
+            if (prevPhase !== undefined) {
+              this.#activeLifecyclePhase.set(thisArg, prevPhase);
+            } else {
+              this.#activeLifecyclePhase.delete(thisArg);
             }
           }
-        },
+        }
+      };
+
+      const wrapped = new Proxy(origFn, {
+        apply: __LIT_DEVTOOLS__lifecycle,
       });
 
       this.#wrappedMethods.add(wrapped);
+      if (isCallableFn(origFn)) {
+        this.#origFnByWrapped.set(wrapped, origFn);
+      }
       Reflect.set(proto, methodName, wrapped);
     };
 
@@ -1192,53 +2296,59 @@ export class LitReactivityTracker {
     const callOrigDispatch = (target: EventTarget, evt: Event): boolean =>
       Boolean(Reflect.apply(origDispatch, target, [evt]));
 
-    const wrappedDispatch = new Proxy(origDispatch, {
-      apply: (target, thisArg, argArray) => {
-        const event: unknown = argArray[0];
-        if (!(thisArg instanceof EventTarget) || !(event instanceof Event)) {
-          return Reflect.apply(target, thisArg, argArray);
-        }
-
-        const type = event.type;
-        if (type === "context-request") {
-          this.#onContextRequestEvent(thisArg, event);
-          return Reflect.apply(target, thisArg, argArray);
-        }
-
-        if (type === "context-provider") {
-          this.#onContextProviderEvent(thisArg, event);
-          return Reflect.apply(target, thisArg, argArray);
-        }
-
-        if (type === "model-update") {
-          return this.#onModelUpdateEvent(thisArg, event, (evt) =>
-            callOrigDispatch(thisArg, evt),
-          );
-        }
-
-        if (type === "view-model-update") {
-          return this.#onViewModelUpdateEvent(thisArg, event, (evt) =>
-            callOrigDispatch(thisArg, evt),
-          );
-        }
-
-        if (
-          this.#settings.captureCustomEvents &&
-          type !== "lit-debug" &&
-          isElement(thisArg) &&
-          thisArg.tagName.includes("-") &&
-          typeof CustomEvent !== "undefined" &&
-          event instanceof CustomEvent &&
-          event.bubbles &&
-          event.composed
-        ) {
-          return this.#onCustomElementEvent(thisArg, event, (evt) =>
-            callOrigDispatch(thisArg, evt),
-          );
-        }
-
+    const __LIT_DEVTOOLS__dispatchEvent = (
+      target: Function,
+      thisArg: unknown,
+      argArray: unknown[],
+    ): unknown => {
+      const event: unknown = argArray[0];
+      if (!(thisArg instanceof EventTarget) || !(event instanceof Event)) {
         return Reflect.apply(target, thisArg, argArray);
-      },
+      }
+
+      const type = event.type;
+      if (type === "context-request") {
+        this.#onContextRequestEvent(thisArg, event);
+        return Reflect.apply(target, thisArg, argArray);
+      }
+
+      if (type === "context-provider") {
+        this.#onContextProviderEvent(thisArg, event);
+        return Reflect.apply(target, thisArg, argArray);
+      }
+
+      if (type === "model-update") {
+        return this.#onModelUpdateEvent(thisArg, event, (evt) =>
+          callOrigDispatch(thisArg, evt),
+        );
+      }
+
+      if (type === "view-model-update") {
+        return this.#onViewModelUpdateEvent(thisArg, event, (evt) =>
+          callOrigDispatch(thisArg, evt),
+        );
+      }
+
+      if (
+        this.#settings.captureCustomEvents &&
+        type !== "lit-debug" &&
+        isElement(thisArg) &&
+        thisArg.tagName.includes("-") &&
+        typeof CustomEvent !== "undefined" &&
+        event instanceof CustomEvent &&
+        event.bubbles &&
+        event.composed
+      ) {
+        return this.#onCustomElementEvent(thisArg, event, (evt) =>
+          callOrigDispatch(thisArg, evt),
+        );
+      }
+
+      return Reflect.apply(target, thisArg, argArray);
+    };
+
+    const wrappedDispatch = new Proxy(origDispatch, {
+      apply: __LIT_DEVTOOLS__dispatchEvent,
     });
 
     Reflect.set(proto, "dispatchEvent", wrappedDispatch);
@@ -1270,57 +2380,62 @@ export class LitReactivityTracker {
     if (typeof origCallback === "function") {
       let wrappedCb = this.#wrappedCallbacks.get(origCallback);
       if (!wrappedCb) {
+        const __LIT_DEVTOOLS__contextCallback = (
+          cbTarget: Function,
+          thisArg: unknown,
+          argArray: unknown[],
+        ): unknown => {
+          const value: unknown = argArray[0];
+          const preview = serializePreview(value);
+          contextNode.valuePreview = preview;
+
+          const top = this.#causalStack.at(-1);
+          const cascadeId = top?.cascadeId ?? this.#nextCascadeId++;
+          const causeId = top?.nodeId ?? contextNode.lastCauseNodeId;
+
+          if (top?.kind !== "context-push") {
+            contextNode.updates += 1;
+          }
+
+          const pushSeq = this.#pushTrace({
+            cascadeId,
+            durationMs: 0,
+            nodeId: contextNode.id,
+            kind: "context-push",
+            label: `${contextNode.label} → ${consumerNode?.label ?? "consumer"}`,
+            causeNodeId: causeId,
+            detail: preview.text,
+          });
+          contextNode.lastChangedSeq = pushSeq;
+
+          if (consumerNode) {
+            const edge = this.#recordEdge(
+              contextNode.id,
+              consumerNode.id,
+              "context-consume",
+              subscribe ? "subscribe" : "once",
+              preview.text,
+            );
+            edge.count += 1;
+            edge.lastSeq = pushSeq;
+          }
+
+          this.#causalStack.push({
+            nodeId: contextNode.id,
+            kind: "context-push",
+            label: `context '${contextNode.label}'`,
+            cascadeId,
+          });
+          this.#scheduleNotify();
+
+          try {
+            return Reflect.apply(cbTarget, thisArg, argArray);
+          } finally {
+            this.#causalStack.pop();
+          }
+        };
         wrappedCb = new Proxy(origCallback, {
-          apply: (cbTarget, thisArg, argArray) => {
-            const value: unknown = argArray[0];
-            const preview = serializePreview(value);
-            contextNode.valuePreview = preview;
-
-            const top = this.#causalStack.at(-1);
-            const cascadeId = top?.cascadeId ?? this.#nextCascadeId++;
-            const causeId = top?.nodeId ?? contextNode.lastCauseNodeId;
-
-            if (top?.kind !== "context-push") {
-              contextNode.updates += 1;
-            }
-
-            const pushSeq = this.#pushTrace({
-              cascadeId,
-              durationMs: 0,
-              nodeId: contextNode.id,
-              kind: "context-push",
-              label: `${contextNode.label} → ${consumerNode?.label ?? "consumer"}`,
-              causeNodeId: causeId,
-              detail: preview.text,
-            });
-            contextNode.lastChangedSeq = pushSeq;
-
-            if (consumerNode) {
-              const edge = this.#recordEdge(
-                contextNode.id,
-                consumerNode.id,
-                "context-consume",
-                subscribe ? "subscribe" : "once",
-                preview.text,
-              );
-              edge.count += 1;
-              edge.lastSeq = pushSeq;
-            }
-
-            this.#causalStack.push({
-              nodeId: contextNode.id,
-              kind: "context-push",
-              label: `context '${contextNode.label}'`,
-              cascadeId,
-            });
-            this.#scheduleNotify();
-
-            try {
-              return Reflect.apply(cbTarget, thisArg, argArray);
-            } finally {
-              this.#causalStack.pop();
-            }
-          },
+          apply: __LIT_DEVTOOLS__contextCallback,
         });
         this.#wrappedCallbacks.set(origCallback, wrappedCb);
         this.#wrappedCallbacks.set(wrappedCb, wrappedCb);
@@ -1338,8 +2453,12 @@ export class LitReactivityTracker {
     if (contextKey === undefined) return;
     const providerHost: unknown = Reflect.get(event, "contextTarget") ?? target;
     const contextNode = this.#ensureContextRecord(contextKey);
+    if (!this.#scanningDom && contextNode.site === null) {
+      contextNode.site = captureCallsite(0);
+    }
 
     if (providerHost !== null && typeof providerHost === "object") {
+      contextNode.providerHostRef = new WeakRef(providerHost);
       const hostNode = this.#ensureHostOrElementRecord(providerHost);
       if (hostNode) {
         this.#recordEdge(
@@ -1375,6 +2494,9 @@ export class LitReactivityTracker {
     origDispatch: (event: Event) => boolean,
   ): boolean {
     const modelNode = this.#ensureModelRecord(target);
+    if (!this.#scanningDom && modelNode.site === null) {
+      modelNode.site = captureCallsite(0);
+    }
     const detail: unknown = Reflect.get(event, "detail");
     const rawModel: unknown =
       detail !== null && typeof detail === "object" && "model" in detail
@@ -1433,6 +2555,9 @@ export class LitReactivityTracker {
     origDispatch: (event: Event) => boolean,
   ): boolean {
     const ctrlNode = this.#ensureControllerRecord(target);
+    if (!this.#scanningDom && ctrlNode.site === null) {
+      ctrlNode.site = captureCallsite(0);
+    }
     this.#scanMemoFields(target, ctrlNode);
 
     const detail: unknown = Reflect.get(event, "detail");
@@ -1588,6 +2713,10 @@ export class LitReactivityTracker {
       const contextNode = this.#ensureContextRecord(ctxMeta.contextKey);
       const hostNode = this.#ensureHostOrElementRecord(host);
       if (ctxMeta.isProvider) {
+        contextNode.providerHostRef = new WeakRef(host);
+        if (!this.#scanningDom && contextNode.site === null) {
+          contextNode.site = captureCallsite(0);
+        }
         if (hostNode) {
           this.#recordEdge(
             hostNode.id,
@@ -1662,6 +2791,7 @@ export class LitReactivityTracker {
     if (this.#wrappedProviders.has(provider)) return;
     this.#wrappedProviders.add(provider);
 
+    contextNode.providerHostRef = new WeakRef(host);
     const hostNode = this.#ensureHostOrElementRecord(host);
     const initialVal: unknown = Reflect.get(provider, "value");
     if (initialVal !== undefined) {
@@ -1670,44 +2800,55 @@ export class LitReactivityTracker {
 
     const origSetValue: unknown = Reflect.get(provider, "setValue");
     if (typeof origSetValue === "function") {
+      const __LIT_DEVTOOLS__contextSetValue = (
+        target: Function,
+        thisArg: unknown,
+        argArray: unknown[],
+      ): unknown => {
+        if (contextNode.site === null) {
+          contextNode.site = captureCallsite(0);
+        }
+        const value: unknown = argArray[0];
+        const force = Boolean(argArray[1]);
+        const prevValue: unknown =
+          thisArg !== null && typeof thisArg === "object"
+            ? Reflect.get(thisArg, "value")
+            : undefined;
+        const changed = force || !Object.is(value, prevValue);
+
+        const preview = serializePreview(value);
+        contextNode.valuePreview = preview;
+        if (changed) {
+          contextNode.updates += 1;
+        }
+
+        const top = this.#causalStack.at(-1);
+        const cascadeId = top?.cascadeId ?? this.#nextCascadeId++;
+        const causeNodeId = top?.nodeId ?? hostNode?.id ?? null;
+
+        contextNode.lastCauseNodeId = causeNodeId;
+        contextNode.lastCauseLabel = top
+          ? top.label
+          : hostNode
+            ? `setValue on ${hostNode.label}`
+            : null;
+
+        this.#causalStack.push({
+          nodeId: causeNodeId ?? contextNode.id,
+          kind: "context-push",
+          label: `context '${contextNode.label}'`,
+          cascadeId,
+        });
+        this.#scheduleNotify();
+
+        try {
+          return Reflect.apply(target, thisArg, argArray);
+        } finally {
+          this.#causalStack.pop();
+        }
+      };
       const wrappedSetValue = new Proxy(origSetValue, {
-        apply: (target, thisArg, argArray) => {
-          const value: unknown = argArray[0];
-          const force = Boolean(argArray[1]);
-          const prevValue: unknown = Reflect.get(thisArg, "value");
-          const changed = force || !Object.is(value, prevValue);
-
-          const preview = serializePreview(value);
-          contextNode.valuePreview = preview;
-          if (changed) {
-            contextNode.updates += 1;
-          }
-
-          const top = this.#causalStack.at(-1);
-          const cascadeId = top?.cascadeId ?? this.#nextCascadeId++;
-          const causeNodeId = top?.nodeId ?? hostNode?.id ?? null;
-
-          contextNode.lastCauseNodeId = causeNodeId;
-          contextNode.lastCauseLabel = top
-            ? top.label
-            : hostNode
-              ? `setValue on ${hostNode.label}`
-              : null;
-
-          this.#causalStack.push({
-            nodeId: causeNodeId ?? contextNode.id,
-            kind: "context-push",
-            label: `context '${contextNode.label}'`,
-            cascadeId,
-          });
-          this.#scheduleNotify();
-
-          try {
-            return Reflect.apply(target, thisArg, argArray);
-          } finally {
-            this.#causalStack.pop();
-          }
-        },
+        apply: __LIT_DEVTOOLS__contextSetValue,
       });
       Reflect.set(provider, "setValue", wrappedSetValue);
     }
@@ -1722,6 +2863,9 @@ export class LitReactivityTracker {
     explicitNewValue?: unknown,
   ): void {
     const record = this.#ensureElementRecord(element);
+    if (!this.#scanningDom && record.site === null) {
+      record.site = captureCallsite(0);
+    }
     const top = this.#causalStack.at(-1);
     const propName = name !== undefined ? String(name) : null;
 
@@ -2042,6 +3186,109 @@ export class LitReactivityTracker {
     }
   }
 
+  #extractMemoFromOwner(
+    owner: object | undefined,
+    fieldName: string,
+  ): { readonly source: string; readonly signature: string } | null {
+    if (!owner) return null;
+    let ctor: unknown = Reflect.get(owner, "constructor");
+
+    while (isUserConstructor(ctor)) {
+      let cached = this.#ctorSourceCache.get(ctor);
+      if (cached === undefined) {
+        cached = null;
+        try {
+          const raw = Function.prototype.toString.call(ctor);
+          if (
+            raw.length <= MAX_CTOR_SOURCE_CHARS &&
+            !raw.includes("[native code]")
+          ) {
+            cached = raw;
+          }
+        } catch {
+          cached = null;
+        }
+        this.#ctorSourceCache.set(ctor, cached);
+      }
+
+      if (cached !== null) {
+        const extracted = extractMemoFromCtorSource(cached, fieldName);
+        if (extracted) return extracted;
+      }
+
+      const nextCtor: unknown = Object.getPrototypeOf(ctor);
+      if (!isCallableFn(nextCtor)) break;
+      ctor = nextCtor;
+    }
+    return null;
+  }
+
+  #wrapControllerTransform(controller: object): void {
+    let holder: object | null = null;
+    if (Object.hasOwn(controller, "_transform")) {
+      holder = controller;
+    } else {
+      let cursor: object | null = Object.getPrototypeOf(controller);
+      const stopEvt =
+        typeof EventTarget !== "undefined" ? EventTarget.prototype : null;
+      while (cursor && cursor !== Object.prototype && cursor !== stopEvt) {
+        if (Object.hasOwn(cursor, "_transform")) {
+          holder = cursor;
+          break;
+        }
+        cursor = Object.getPrototypeOf(cursor);
+      }
+    }
+    if (!holder) return;
+
+    const desc = Object.getOwnPropertyDescriptor(holder, "_transform");
+    if (
+      !desc ||
+      typeof desc.value !== "function" ||
+      this.#wrappedMethods.has(desc.value)
+    ) {
+      return;
+    }
+    if (!desc.writable && !desc.configurable) return;
+
+    const origTransform: Function = desc.value;
+    const __LIT_DEVTOOLS__controllerTransform = (
+      target: Function,
+      thisArg: unknown,
+      argArray: unknown[],
+    ): unknown => {
+      if (thisArg === null || typeof thisArg !== "object") {
+        return Reflect.apply(target, thisArg, argArray);
+      }
+      const ctrlNode = this.#ensureControllerRecord(thisArg);
+      if (ctrlNode.site === null) {
+        ctrlNode.site = captureCallsite(0);
+      }
+      this.#scanMemoFields(thisArg, ctrlNode);
+      const cascadeId = this.#currentCascadeId();
+      this.#causalStack.push({
+        nodeId: ctrlNode.id,
+        kind: "controller",
+        label: ctrlNode.label,
+        cascadeId,
+        phase: "_transform",
+      });
+      try {
+        return Reflect.apply(target, thisArg, argArray);
+      } finally {
+        this.#causalStack.pop();
+      }
+    };
+    const wrapped = new Proxy(origTransform, {
+      apply: __LIT_DEVTOOLS__controllerTransform,
+    });
+    this.#wrappedMethods.add(wrapped);
+    if (isCallableFn(origTransform)) {
+      this.#origFnByWrapped.set(wrapped, origTransform);
+    }
+    Reflect.set(holder, "_transform", wrapped);
+  }
+
   #wrapMemoField<T extends MemoizedFunctionLike>(
     fn: T,
     ownerRecord: NodeRecord,
@@ -2050,6 +3297,9 @@ export class LitReactivityTracker {
   ): T {
     const existingId = this.#idByObject.get(fn);
     if (existingId !== undefined) return fn;
+
+    const ownerInst = ownerRecord.ref.deref();
+    const layerA = this.#extractMemoFromOwner(ownerInst, fieldName);
 
     const memoId = this.#nextNodeId++;
     const record: NodeRecord = {
@@ -2071,6 +3321,8 @@ export class LitReactivityTracker {
       lastCauseNodeId: ownerRecord.id,
       valuePreview: null,
       error: null,
+      computeSource: layerA?.source ?? null,
+      computeSignature: layerA?.signature ?? null,
     };
 
     const edgeKind: EdgeKind =
@@ -2086,6 +3338,26 @@ export class LitReactivityTracker {
     const wrapped = wrapMemoizedFunction(
       fn,
       (call) => {
+        if (record.site === null) {
+          record.site = captureCallsite(0);
+        }
+        if (ownerRecord.site === null && record.site) {
+          ownerRecord.site = record.site;
+        }
+        if (call.innerFn && !record.innerMemoFnRef?.deref()) {
+          record.innerMemoFnRef = new WeakRef(call.innerFn);
+          try {
+            const rawInner = Function.prototype.toString.call(call.innerFn);
+            const layerB = normalizeMemoSource(rawInner);
+            if (layerB) {
+              record.computeSource = layerB.source;
+              record.computeSignature = layerB.signature;
+            }
+          } catch {
+            // Ignore unreadable innerFn.toString()
+          }
+        }
+
         const top = this.#causalStack.at(-1);
         const phase =
           top?.nodeId === ownerRecord.id
@@ -2174,14 +3446,24 @@ export class LitReactivityTracker {
     const existingId = this.#idByObject.get(element);
     if (existingId !== undefined) {
       const existing = this.#nodesById.get(existingId);
-      if (existing) return existing;
+      if (existing) {
+        if (!this.#scanningDom && existing.site === null) {
+          const ctor: unknown = element.constructor;
+          existing.site =
+            typeof ctor === "function"
+              ? (this.#defineSites.get(ctor) ?? null)
+              : null;
+        }
+        return existing;
+      }
     }
 
     const id = this.#nextNodeId++;
-    const tag = element.tagName.toLowerCase();
-    const idAttr = element.id ? `#${element.id}` : null;
-    const label =
-      this.#deferredLabels.get(element) ?? (idAttr ? `${tag}${idAttr}` : tag);
+    const tag = (element.tagName ?? "element").toLowerCase();
+    const explicitLabel = this.#deferredLabels.get(element);
+    const trimmedId = (element.id ?? "").trim();
+    const idAttr = trimmedId ? `#${trimmedId}` : null;
+    const label = explicitLabel ?? (idAttr ? `${tag}${idAttr}` : tag);
     const ctor: unknown = element.constructor;
     const site =
       typeof ctor === "function" ? (this.#defineSites.get(ctor) ?? null) : null;
@@ -2195,6 +3477,9 @@ export class LitReactivityTracker {
       subtitle: getCtorName(element),
       site,
       connected: element.isConnected,
+      tagName: tag,
+      ...(explicitLabel ? { explicitLabel } : {}),
+      disambiguator: explicitLabel ? null : idAttr,
       updates: 0,
       hits: 0,
       misses: 0,
@@ -2213,6 +3498,7 @@ export class LitReactivityTracker {
     this.#nodesById.set(id, record);
     this.#idByObject.set(element, id);
     this.#finalizer.register(element, id);
+    record.domParentNodeId = this.#resolveDomParentNodeId(element);
     return record;
   }
 
@@ -2231,7 +3517,12 @@ export class LitReactivityTracker {
     const existingId = this.#idByObject.get(model);
     if (existingId !== undefined) {
       const existing = this.#nodesById.get(existingId);
-      if (existing) return existing;
+      if (existing) {
+        if (!this.#scanningDom && existing.site === null) {
+          existing.site = captureCallsite(0);
+        }
+        return existing;
+      }
     }
 
     const id = this.#nextNodeId++;
@@ -2243,7 +3534,7 @@ export class LitReactivityTracker {
       ref: new WeakRef(model),
       label,
       subtitle: "Model",
-      site: captureCallsite(2),
+      site: this.#scanningDom ? null : captureCallsite(0),
       connected: true,
       updates: 0,
       hits: 0,
@@ -2269,7 +3560,13 @@ export class LitReactivityTracker {
     const existingId = this.#idByObject.get(controller);
     if (existingId !== undefined) {
       const existing = this.#nodesById.get(existingId);
-      if (existing) return existing;
+      if (existing) {
+        if (!this.#scanningDom && existing.site === null) {
+          existing.site = captureCallsite(0);
+        }
+        this.#wrapControllerTransform(controller);
+        return existing;
+      }
     }
 
     const id = this.#nextNodeId++;
@@ -2283,7 +3580,7 @@ export class LitReactivityTracker {
       ref: new WeakRef(controller),
       label,
       subtitle: "Controller",
-      site: captureCallsite(2),
+      site: this.#scanningDom ? null : captureCallsite(0),
       connected: true,
       updates: 0,
       hits: 0,
@@ -2299,6 +3596,7 @@ export class LitReactivityTracker {
     this.#nodesById.set(id, record);
     this.#idByObject.set(controller, id);
     this.#finalizer.register(controller, id);
+    this.#wrapControllerTransform(controller);
     return record;
   }
 

@@ -6,9 +6,18 @@ import type {
   TraceEvent,
   TraceKind,
 } from "../protocol/types.ts";
+import {
+  listExcludedTags,
+  listIncludedTags,
+  matchGlob,
+  parseQuery,
+  type ParsedQuery,
+  type QueryToken,
+} from "../shared/query-parser.ts";
 import { computeGraphLayout, type GraphLayout } from "./graph-layout.ts";
 
 export type KindFilter = "all" | NodeKind;
+export type QueryMode = "highlight" | "filter";
 export type TraceCategoryFilter =
   | "all"
   | "render"
@@ -21,12 +30,27 @@ export type TraceCategoryFilter =
 
 export interface PanelFilterState {
   readonly query: string;
+  readonly queryMode: QueryMode;
   readonly kindFilter: KindFilter;
   readonly connectedOnly: boolean;
   readonly onlyErrors: boolean;
   readonly focusSubgraphNodeId: number | null;
+  readonly expandedMemoOwnerIds: ReadonlySet<number>;
   readonly traceCategory: TraceCategoryFilter;
   readonly followSelectionInTraces: boolean;
+}
+
+export interface TagInventoryEntry {
+  readonly tagName: string;
+  readonly count: number;
+  readonly excluded: boolean;
+  readonly included: boolean;
+}
+
+export interface TagPrefixGroup {
+  readonly prefix: string;
+  readonly count: number;
+  readonly excluded: boolean;
 }
 
 export interface WaterfallCascade {
@@ -47,6 +71,12 @@ export interface PanelViewModel {
   readonly upstreamIds: ReadonlySet<number>;
   readonly downstreamIds: ReadonlySet<number>;
   readonly directCauseNodeIds: ReadonlySet<number>;
+  readonly queryMode: QueryMode;
+  readonly isHighlightQueryActive: boolean;
+  readonly searchMatchIds: ReadonlySet<number>;
+  readonly orderedMatchIds: ReadonlyArray<number>;
+  readonly tagInventory: ReadonlyArray<TagInventoryEntry>;
+  readonly prefixGroups: ReadonlyArray<TagPrefixGroup>;
   readonly filteredEvents: ReadonlyArray<TraceEvent>;
   readonly cascades: ReadonlyArray<WaterfallCascade>;
   readonly stats: {
@@ -65,10 +95,12 @@ export interface PanelViewModel {
 
 export const DEFAULT_FILTER_STATE: PanelFilterState = {
   query: "",
+  queryMode: "highlight",
   kindFilter: "all",
   connectedOnly: false,
   onlyErrors: false,
   focusSubgraphNodeId: null,
+  expandedMemoOwnerIds: new Set(),
   traceCategory: "all",
   followSelectionInTraces: false,
 };
@@ -117,7 +149,109 @@ export function collectReachableIds(
   return visited;
 }
 
-export function nodeMatchesFilter(
+export function getNodeTagName(node: ReactivityNodeSnapshot): string | null {
+  if (node.tagName && node.tagName.trim().length > 0) {
+    return node.tagName.trim().toLowerCase();
+  }
+  if (node.kind === "element") {
+    const firstWord = node.label.trim().split(/\s+/)[0] ?? "";
+    const stripped = firstWord.replace(/^<|>$/g, "");
+    if (stripped.length > 0) {
+      return stripped.toLowerCase();
+    }
+  }
+  return null;
+}
+
+export function nodeMatchesToken(
+  node: ReactivityNodeSnapshot,
+  token: QueryToken,
+): boolean {
+  if (token.value.length === 0) return true;
+
+  switch (token.field) {
+    case "tag": {
+      const tag = getNodeTagName(node);
+      return tag !== null && matchGlob(token.value, tag);
+    }
+    case "kind":
+      return matchGlob(token.value, node.kind);
+    case "prop":
+      return (
+        node.properties?.some(
+          (p) =>
+            matchGlob(token.value, p.name) ||
+            (p.attribute !== null && matchGlob(token.value, p.attribute)),
+        ) ?? false
+      );
+    case "file":
+      return (
+        node.site !== null &&
+        node.site.file.toLowerCase().includes(token.value.toLowerCase())
+      );
+    case "is": {
+      switch (token.value.toLowerCase()) {
+        case "connected":
+          return node.connected;
+        case "disconnected":
+          return !node.connected;
+        case "error":
+        case "errors":
+          return node.error !== null;
+        case "veto":
+        case "vetoed":
+        case "vetoes":
+          return node.vetoes > 0;
+        case "shadow":
+          return node.rootType === "shadow";
+        case "light":
+          return node.rootType === "light";
+        case "closed-shadow":
+        case "closed":
+          return node.rootType === "closed-shadow";
+        case "memo":
+          return node.kind === "computed" || node.kind === "observer";
+        case "updated":
+        case "dirty":
+          return node.updates > 0;
+        default:
+          return false;
+      }
+    }
+    case "id":
+      return /^\d+$/.test(token.value) && node.id === Number(token.value);
+    case "text": {
+      const needle = token.value.toLowerCase();
+      if (`#${node.id}`.includes(needle)) return true;
+      if (node.label.toLowerCase().includes(needle)) return true;
+      if (node.kind.toLowerCase().includes(needle)) return true;
+      if (node.tagName?.toLowerCase().includes(needle)) return true;
+      if (node.disambiguator?.toLowerCase().includes(needle)) return true;
+      if (node.computeSource?.toLowerCase().includes(needle)) return true;
+      if (node.computeSignature?.toLowerCase().includes(needle)) return true;
+      if (node.subtitle?.toLowerCase().includes(needle)) return true;
+      if (node.value?.text.toLowerCase().includes(needle)) return true;
+      if (node.error?.toLowerCase().includes(needle)) return true;
+      if (node.lastCauseLabel?.toLowerCase().includes(needle)) return true;
+      if (node.site?.file.toLowerCase().includes(needle)) return true;
+      if (
+        node.properties?.some(
+          (p) =>
+            p.name.toLowerCase().includes(needle) ||
+            p.value.text.toLowerCase().includes(needle) ||
+            (p.attribute?.toLowerCase().includes(needle) ?? false),
+        )
+      ) {
+        return true;
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+function nodeMatchesBaseStructural(
   node: ReactivityNodeSnapshot,
   filter: PanelFilterState,
   subgraphIds: ReadonlySet<number> | null,
@@ -134,27 +268,103 @@ export function nodeMatchesFilter(
   if (filter.onlyErrors && node.error === null && node.vetoes === 0) {
     return false;
   }
+  return true;
+}
 
-  const q = filter.query.trim().toLowerCase();
-  if (!q) return true;
-
-  if (`#${node.id}`.includes(q)) return true;
-  if (node.label.toLowerCase().includes(q)) return true;
-  if (node.kind.includes(q)) return true;
-  if (node.subtitle?.toLowerCase().includes(q)) return true;
-  if (node.value?.text.toLowerCase().includes(q)) return true;
-  if (node.error?.toLowerCase().includes(q)) return true;
-  if (node.site?.file.toLowerCase().includes(q)) return true;
-  if (
-    node.properties?.some(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.value.text.toLowerCase().includes(q),
-    )
-  ) {
-    return true;
+export function nodeMatchesFilter(
+  node: ReactivityNodeSnapshot,
+  filter: PanelFilterState,
+  subgraphIds: ReadonlySet<number> | null,
+  parsedQuery: ParsedQuery = parseQuery(filter.query),
+): boolean {
+  if (!nodeMatchesBaseStructural(node, filter, subgraphIds)) {
+    return false;
   }
-  return false;
+  if (parsedQuery.exclusions.some((token) => nodeMatchesToken(node, token))) {
+    return false;
+  }
+  if (filter.queryMode === "filter" && parsedQuery.inclusions.length > 0) {
+    return parsedQuery.inclusions.every((token) =>
+      nodeMatchesToken(node, token),
+    );
+  }
+  return true;
+}
+
+function buildTagInventoryAndPrefixes(
+  nodes: ReadonlyArray<ReactivityNodeSnapshot>,
+  filter: PanelFilterState,
+  subgraphIds: ReadonlySet<number> | null,
+  parsedQuery: ParsedQuery,
+): {
+  readonly tagInventory: ReadonlyArray<TagInventoryEntry>;
+  readonly prefixGroups: ReadonlyArray<TagPrefixGroup>;
+} {
+  const counts = new Map<string, number>();
+  for (const node of nodes) {
+    if (!nodeMatchesBaseStructural(node, filter, subgraphIds)) continue;
+    if (
+      parsedQuery.exclusions.some(
+        (token) => token.field !== "tag" && nodeMatchesToken(node, token),
+      )
+    ) {
+      continue;
+    }
+    const tag = getNodeTagName(node);
+    if (tag === null) continue;
+    counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+
+  const excludedTags = listExcludedTags(filter.query);
+  const includedTags = listIncludedTags(filter.query);
+
+  const tagInventory: TagInventoryEntry[] = [];
+  for (const [tagName, count] of counts.entries()) {
+    tagInventory.push({
+      tagName,
+      count,
+      excluded: excludedTags.some((pattern) => matchGlob(pattern, tagName)),
+      included: includedTags.some((pattern) => matchGlob(pattern, tagName)),
+    });
+  }
+
+  tagInventory.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return a.tagName < b.tagName ? -1 : a.tagName > b.tagName ? 1 : 0;
+  });
+
+  const byPrefix = new Map<string, TagInventoryEntry[]>();
+  for (const entry of tagInventory) {
+    const dashIdx = entry.tagName.indexOf("-");
+    if (dashIdx <= 0) continue;
+    const prefix = `${entry.tagName.slice(0, dashIdx)}-*`;
+    const list = byPrefix.get(prefix);
+    if (list) list.push(entry);
+    else byPrefix.set(prefix, [entry]);
+  }
+
+  const prefixGroups: TagPrefixGroup[] = [];
+  for (const [prefix, entries] of byPrefix.entries()) {
+    if (entries.length < 2) continue;
+    let count = 0;
+    for (const entry of entries) count += entry.count;
+    const excluded =
+      excludedTags.some(
+        (pattern) => pattern.toLowerCase() === prefix.toLowerCase(),
+      ) || entries.every((entry) => entry.excluded);
+    prefixGroups.push({
+      prefix,
+      count,
+      excluded,
+    });
+  }
+
+  prefixGroups.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0;
+  });
+
+  return { tagInventory, prefixGroups };
 }
 
 function buildCascades(
@@ -204,6 +414,12 @@ export function derivePanelViewModel(
       upstreamIds: new Set(),
       downstreamIds: new Set(),
       directCauseNodeIds: new Set(),
+      queryMode: filter.queryMode,
+      isHighlightQueryActive: false,
+      searchMatchIds: new Set(),
+      orderedMatchIds: [],
+      tagInventory: [],
+      prefixGroups: [],
       filteredEvents: [],
       cascades: [],
       stats: {
@@ -281,16 +497,71 @@ export function derivePanelViewModel(
     subgraphIds = new Set<number>([focusedNode.id, ...up, ...down]);
   }
 
-  const visibleNodes = snapshot.nodes.filter((node) =>
-    nodeMatchesFilter(node, filter, subgraphIds),
+  const parsedQuery = parseQuery(filter.query);
+  const { tagInventory, prefixGroups } = buildTagInventoryAndPrefixes(
+    snapshot.nodes,
+    filter,
+    subgraphIds,
+    parsedQuery,
   );
+
+  const structurallyVisibleNodes = snapshot.nodes.filter(
+    (node) =>
+      nodeMatchesBaseStructural(node, filter, subgraphIds) &&
+      !parsedQuery.exclusions.some((token) => nodeMatchesToken(node, token)),
+  );
+
+  const hasPositiveInclusions = parsedQuery.inclusions.length > 0;
+  const isHighlightQueryActive =
+    filter.queryMode === "highlight" && hasPositiveInclusions;
+
+  const matchingNodes = hasPositiveInclusions
+    ? structurallyVisibleNodes.filter((node) =>
+        parsedQuery.inclusions.every((token) => nodeMatchesToken(node, token)),
+      )
+    : [];
+  const searchMatchIds = new Set(matchingNodes.map((n) => n.id));
+
+  const visibleNodes =
+    filter.queryMode === "filter" && hasPositiveInclusions
+      ? matchingNodes
+      : structurallyVisibleNodes;
+
   const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
   const visibleEdges = snapshot.edges.filter(
     (edge) =>
       visibleNodeIds.has(edge.sourceId) && visibleNodeIds.has(edge.targetId),
   );
 
-  const layout = computeGraphLayout(visibleNodes, visibleEdges);
+  const layout = computeGraphLayout(visibleNodes, visibleEdges, {
+    expandedMemoOwnerIds: filter.expandedMemoOwnerIds,
+  });
+
+  const clusterIdByMemberId = new Map<number, number>();
+  for (const cluster of layout.clusters ?? []) {
+    if (!cluster.expanded) {
+      for (const memberId of cluster.memberIds) {
+        clusterIdByMemberId.set(memberId, cluster.clusterNodeId);
+      }
+    }
+  }
+
+  const orderedMatchTargetIds = new Set<number>();
+  for (const matchId of searchMatchIds) {
+    orderedMatchTargetIds.add(clusterIdByMemberId.get(matchId) ?? matchId);
+  }
+
+  const orderedMatchIds = Array.from(orderedMatchTargetIds).toSorted((a, b) => {
+    const posA = layout.nodeById.get(a);
+    const posB = layout.nodeById.get(b);
+    if (!posA && !posB) return a - b;
+    if (!posA) return 1;
+    if (!posB) return -1;
+    if (posA.layer !== posB.layer) return posA.layer - posB.layer;
+    if (posA.row !== posB.row) return posA.row - posB.row;
+    return posA.node.id - posB.node.id;
+  });
+
   const selectedNode =
     selectedNodeId !== null ? (nodeById.get(selectedNodeId) ?? null) : null;
 
@@ -333,6 +604,12 @@ export function derivePanelViewModel(
     upstreamIds,
     downstreamIds,
     directCauseNodeIds,
+    queryMode: filter.queryMode,
+    isHighlightQueryActive,
+    searchMatchIds,
+    orderedMatchIds,
+    tagInventory,
+    prefixGroups,
     filteredEvents,
     cascades,
     stats: {

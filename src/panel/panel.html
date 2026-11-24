@@ -111,11 +111,59 @@
               id="search-input"
               class="search-input"
               data-testid="search-input"
-              placeholder="Filter by tag, prop, context, file…"
-              aria-label="Filter graph nodes by tag, property, context, or file"
+              placeholder="Highlight or filter (-tag:, kind:, prop:, file:)…"
+              aria-label="Highlight or filter graph nodes (-tag:, kind:, prop:, file:)"
               autocomplete="off"
               spellcheck="false"
             />
+            <div class="search-nav-group" id="search-nav-group" hidden>
+              <span
+                class="search-match-count"
+                id="search-match-count"
+                data-testid="search-match-count"
+                >0/0</span
+              >
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-prev-btn"
+                data-testid="search-prev-btn"
+                aria-label="Previous match"
+                title="Previous match (Shift+Enter)"
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-next-btn"
+                data-testid="search-next-btn"
+                aria-label="Next match"
+                title="Next match (Enter)"
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-clear-btn"
+                data-testid="search-clear-btn"
+                aria-label="Clear search"
+                title="Clear search"
+              >
+                ×
+              </button>
+            </div>
+            <button
+              type="button"
+              class="search-mode-btn"
+              id="search-mode-btn"
+              data-testid="search-mode-btn"
+              aria-pressed="false"
+              title="Toggle Highlight vs Filter search mode"
+            >
+              Highlight
+            </button>
           </div>
 
           <div class="toolbar-actions">
@@ -322,6 +370,28 @@
             </button>
           </div>
 
+          <div class="tags-dropdown-wrap" id="tags-dropdown-wrap">
+            <button
+              type="button"
+              class="filter-pill tags-filter-btn"
+              id="tags-filter-btn"
+              data-testid="tags-filter-btn"
+              aria-expanded="false"
+              aria-controls="tags-popover"
+              title="Filter web component tags (-tag:)"
+            >
+              Tags ▾
+            </button>
+            <div
+              class="tags-popover"
+              id="tags-popover"
+              data-testid="tags-popover"
+              role="dialog"
+              aria-label="Filter web component tags"
+              hidden
+            ></div>
+          </div>
+
           <div
             class="focus-breadcrumb"
             id="focus-breadcrumb"
@@ -353,7 +423,7 @@
         </div>
       </header>
 
-      <main class="workspace">
+      <main class="workspace" id="workspace">
         <section class="graph-pane" aria-label="Causal reactivity graph">
           <div class="graph-canvas" id="graph-canvas"></div>
           <div
@@ -539,6 +609,16 @@
           </button>
         </div>
 
+        <div
+          class="splitter splitter-vertical"
+          id="splitter-right"
+          data-testid="splitter-right"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize right inspector pane"
+          tabindex="0"
+        ></div>
+
         <aside
           class="inspector-pane"
           id="inspector-view"
@@ -546,12 +626,34 @@
           aria-label="Node Inspector"
         ></aside>
 
+        <div
+          class="splitter splitter-horizontal"
+          id="splitter-bottom"
+          data-testid="splitter-bottom"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize bottom waterfall pane"
+          tabindex="0"
+        ></div>
+
         <section
           class="waterfall-pane"
           id="waterfall-view"
           data-testid="waterfall-view"
           aria-label="Waterfall and Trace Timeline"
         ></section>
+
+        <div class="bottom-collapsed-bar" id="bottom-collapsed-bar" hidden>
+          <button
+            type="button"
+            class="restore-bottom-btn"
+            id="restore-bottom-btn"
+            data-testid="restore-bottom-btn"
+            title="Expand Timeline / Waterfall pane"
+          >
+            Timeline / Waterfall (collapsed) — Expand ▴
+          </button>
+        </div>
       </main>
     </div>
 

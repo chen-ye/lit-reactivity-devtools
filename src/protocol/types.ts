@@ -91,6 +91,12 @@ export interface ReactivityNodeSnapshot {
   readonly rootType?: "shadow" | "light" | "closed-shadow";
   readonly properties?: ReadonlyArray<ReactivePropertySnapshot>;
   readonly lastArgs?: ReadonlyArray<ValuePreview>;
+  readonly ownerNodeId?: number;
+  readonly domParentNodeId?: number;
+  readonly tagName?: string;
+  readonly disambiguator?: string | null;
+  readonly computeSource?: string | null;
+  readonly computeSignature?: string | null;
 }
 
 export interface ReactivityEdgeSnapshot {
@@ -167,6 +173,10 @@ export interface LitDevtoolsHook {
   highlightElement(nodeId: number | null): void;
   getElementById(nodeId: number): Element | null;
   selectElementFromElementsPanel(el: Element | null): number | null;
+  getDefinitionTarget?(
+    nodeId: number,
+    propName?: string | null,
+  ): ((...args: never[]) => unknown) | null;
   configure(settings: Partial<HookSettings>): void;
   clearEvents(): void;
   subscribe(listener: () => void): () => void;

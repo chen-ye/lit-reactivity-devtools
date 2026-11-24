@@ -3,7 +3,25 @@ import type {
   BackgroundToPanelMessage,
   GraphSnapshot,
   NodeKind,
+  SourceLocation,
 } from "../protocol/types.ts";
+import {
+  createPaneLayoutController,
+  getDefaultBottomBounds,
+  getDefaultRightBounds,
+} from "../shared/pane-layout.ts";
+import {
+  clearTagTokens,
+  listExcludedTags,
+  listIncludedTags,
+  matchGlob,
+  parseQuery,
+  rewriteFieldInclusionsToExclusions,
+  setTagExcludedInQuery,
+  setTagOnlyInQuery,
+} from "../shared/query-parser.ts";
+import { registerPanelShortcuts } from "../shared/shortcuts.ts";
+import { createThemeController } from "../shared/theme.ts";
 import {
   DEFAULT_FILTER_STATE,
   derivePanelViewModel,
@@ -19,7 +37,6 @@ import { WaterfallView } from "./waterfall-view.ts";
 
 type ConnectionState =
   "connecting" | "connected" | "navigating" | "disconnected";
-type ThemePreference = "auto" | "dark" | "light";
 type DrawerTab = "inspector" | "waterfall";
 
 type PendingRequest =
@@ -31,6 +48,7 @@ type PendingRequest =
   | { readonly kind: "clear-memo"; readonly nodeId: number };
 
 const THEME_STORAGE_KEY = "lit-flow-theme";
+const PANE_LAYOUT_STORAGE_KEY = "lit-flow-pane-layout";
 const VALID_KINDS = new Set<string>([
   "all",
   "model",
@@ -53,26 +71,6 @@ function isKindFilter(value: string): value is KindFilter {
   return VALID_KINDS.has(value);
 }
 
-function readStoredTheme(): ThemePreference {
-  try {
-    const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
-    if (raw === "dark" || raw === "light" || raw === "auto") {
-      return raw;
-    }
-  } catch {
-    // Storage may be unavailable in restricted contexts
-  }
-  return "auto";
-}
-
-function writeStoredTheme(pref: ThemePreference): void {
-  try {
-    window.localStorage.setItem(THEME_STORAGE_KEY, pref);
-  } catch {
-    // Ignore storage write errors
-  }
-}
-
 function formatHostUrl(url: string | null): string {
   if (!url) return "";
   try {
@@ -92,12 +90,23 @@ function formatNodeLabel(kind: NodeKind, label: string): string {
 
 function bootstrapPanel(): void {
   const panelShell = mustEl("panel-shell", HTMLDivElement);
+  const workspaceEl = mustEl("workspace", HTMLElement);
+  const rightSplitterEl = mustEl("splitter-right", HTMLDivElement);
+  const bottomSplitterEl = mustEl("splitter-bottom", HTMLDivElement);
+  const bottomCollapsedBar = mustEl("bottom-collapsed-bar", HTMLDivElement);
+  const restoreBottomBtn = mustEl("restore-bottom-btn", HTMLButtonElement);
   const connectionStatusEl = mustEl("connection-status", HTMLSpanElement);
   const connectionStatusTextEl = mustEl(
     "connection-status-text",
     HTMLSpanElement,
   );
   const searchInput = mustEl("search-input", HTMLInputElement);
+  const searchNavGroup = mustEl("search-nav-group", HTMLDivElement);
+  const searchMatchCountEl = mustEl("search-match-count", HTMLSpanElement);
+  const searchPrevBtn = mustEl("search-prev-btn", HTMLButtonElement);
+  const searchNextBtn = mustEl("search-next-btn", HTMLButtonElement);
+  const searchClearBtn = mustEl("search-clear-btn", HTMLButtonElement);
+  const searchModeBtn = mustEl("search-mode-btn", HTMLButtonElement);
   const pauseBtn = mustEl("pause-btn", HTMLButtonElement);
   const memoHitsBtn = mustEl("memo-hits-btn", HTMLButtonElement);
   const eventsBtn = mustEl("events-btn", HTMLButtonElement);
@@ -108,6 +117,9 @@ function bootstrapPanel(): void {
   const kindFilterGroup = mustEl("kind-filter-group", HTMLDivElement);
   const connectedOnlyBtn = mustEl("connected-only-btn", HTMLButtonElement);
   const onlyErrorsBtn = mustEl("only-errors-btn", HTMLButtonElement);
+  const tagsDropdownWrap = mustEl("tags-dropdown-wrap", HTMLDivElement);
+  const tagsFilterBtn = mustEl("tags-filter-btn", HTMLButtonElement);
+  const tagsPopover = mustEl("tags-popover", HTMLDivElement);
   const focusBreadcrumb = mustEl("focus-breadcrumb", HTMLDivElement);
   const focusBreadcrumbLabel = mustEl(
     "focus-breadcrumb-label",
@@ -139,14 +151,19 @@ function bootstrapPanel(): void {
   }
 
   let snapshot: GraphSnapshot | null = null;
-  let filter: PanelFilterState = { ...DEFAULT_FILTER_STATE };
+  let filter: PanelFilterState = {
+    ...DEFAULT_FILTER_STATE,
+    expandedMemoOwnerIds: new Set(),
+  };
   let selectedNodeId: number | null = null;
   let connectionState: ConnectionState = "connecting";
   let connectedUrl: string | null = null;
-  let themePreference: ThemePreference = readStoredTheme();
   let activeTab: DrawerTab = "inspector";
   let requestCounter = 0;
   let lastHighlightedNodeId: number | null = null;
+  let activeMatchIndex = -1;
+  let activeSearchMatchId: number | null = null;
+  let lastVm: PanelViewModel | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let handshakeTimer: ReturnType<typeof setInterval> | null = null;
   let handshakeAttempts = 0;
@@ -165,23 +182,18 @@ function bootstrapPanel(): void {
     }, 2400);
   };
 
-  const applyTheme = (): void => {
-    if (themePreference === "auto") {
-      const devtoolsTheme = transport.getDevToolsTheme();
-      if (devtoolsTheme) {
-        document.documentElement.dataset.theme = devtoolsTheme;
-      } else {
-        delete document.documentElement.dataset.theme;
-      }
-      themeBtn.textContent = "Theme: Auto";
-    } else if (themePreference === "dark") {
-      document.documentElement.dataset.theme = "dark";
-      themeBtn.textContent = "Theme: Dark";
-    } else {
-      document.documentElement.dataset.theme = "light";
-      themeBtn.textContent = "Theme: Light";
-    }
-  };
+  const themeController = createThemeController({
+    storageKey: THEME_STORAGE_KEY,
+    getDevToolsTheme: () => transport.getDevToolsTheme(),
+    onChange: (preference) => {
+      themeBtn.textContent =
+        preference === "auto"
+          ? "Theme: Auto"
+          : preference === "dark"
+            ? "Theme: Dark"
+            : "Theme: Light";
+    },
+  });
 
   const setActiveTab = (tab: DrawerTab): void => {
     activeTab = tab;
@@ -208,6 +220,49 @@ function bootstrapPanel(): void {
     return `req-${requestCounter}`;
   };
 
+  const toggleMemoCluster = (ownerId: number): void => {
+    const nextExpanded = new Set(filter.expandedMemoOwnerIds);
+    if (nextExpanded.has(ownerId)) {
+      nextExpanded.delete(ownerId);
+    } else {
+      nextExpanded.add(ownerId);
+    }
+    filter = { ...filter, expandedMemoOwnerIds: nextExpanded };
+    renderAll();
+  };
+
+  const setTagExcluded = (tagName: string, excluded: boolean): void => {
+    const allTagNames = lastVm?.tagInventory.map((entry) => entry.tagName);
+    const nextQuery = setTagExcludedInQuery(
+      filter.query,
+      tagName,
+      excluded,
+      allTagNames,
+    );
+    applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+    showToast(excluded ? `Hidden <${tagName}>` : `Shown <${tagName}>`);
+  };
+
+  const openSourceForNode = (
+    nodeId: number,
+    site: SourceLocation | null,
+    propName?: string | null,
+  ): void => {
+    void transport.openSource(nodeId, site, propName).then((result) => {
+      if (result.ok) {
+        const msg =
+          transport.mode === "bridge"
+            ? "Copied source location to clipboard"
+            : "Opened source in Sources";
+        showToast(msg);
+        inspectorView.showNodeActionMessage(nodeId, true, msg);
+      } else {
+        showToast(result.error);
+        inspectorView.showNodeActionMessage(nodeId, false, result.error);
+      }
+    });
+  };
+
   const graphView = new GraphView(graphCanvas, {
     onSelectNode(nodeId) {
       selectedNodeId = nodeId;
@@ -226,6 +281,9 @@ function bootstrapPanel(): void {
     },
     onZoomChange(scale) {
       zoomReadout.textContent = `${Math.round(scale * 100)}%`;
+    },
+    onToggleMemoCluster(ownerId: number) {
+      toggleMemoCluster(ownerId);
     },
   });
 
@@ -274,7 +332,22 @@ function bootstrapPanel(): void {
       transport.send({ type: "LOG_NODE", nodeId });
       showToast("Logged node to Console as $lit");
     },
+    onOpenSource(
+      nodeId: number,
+      site: SourceLocation | null,
+      propName?: string | null,
+    ) {
+      openSourceForNode(nodeId, site, propName);
+    },
+    onHideTag(tagName: string, nextExcluded = true) {
+      setTagExcluded(tagName, nextExcluded);
+    },
+    onToggleMemoCluster(ownerId: number) {
+      toggleMemoCluster(ownerId);
+    },
   });
+
+  let paneLayout: ReturnType<typeof createPaneLayoutController> | null = null;
 
   const waterfallView = new WaterfallView(waterfallContainer, {
     onSelectNode(nodeId) {
@@ -299,7 +372,57 @@ function bootstrapPanel(): void {
     onClearEvents() {
       transport.send({ type: "CLEAR_EVENTS" });
     },
+    onToggleBottomCollapse() {
+      paneLayout?.toggleBottomCollapsed();
+    },
   });
+
+  const syncBottomCollapsedUi = (collapsed: boolean): void => {
+    bottomCollapsedBar.hidden = !collapsed;
+    waterfallView.setBottomCollapsed(collapsed);
+  };
+
+  paneLayout = createPaneLayoutController({
+    rootEl: panelShell,
+    workspaceEl,
+    rightSplitterEl,
+    bottomSplitterEl,
+    getRightBounds: (w) => getDefaultRightBounds(Math.max(0, w - 6)),
+    getBottomBounds: (h) => getDefaultBottomBounds(Math.max(0, h - 6)),
+    storageKey: PANE_LAYOUT_STORAGE_KEY,
+    defaultState: {
+      rightWidthPx: 340,
+      bottomHeightPx: 220,
+      bottomCollapsed: false,
+    },
+    onChange: (state) => {
+      syncBottomCollapsedUi(state.bottomCollapsed);
+    },
+  });
+  syncBottomCollapsedUi(paneLayout.getState().bottomCollapsed);
+
+  const reconcileActiveMatch = (vm: PanelViewModel): number | null => {
+    const matches = vm.orderedMatchIds;
+    if (matches.length === 0) {
+      activeMatchIndex = -1;
+      activeSearchMatchId = null;
+      return null;
+    }
+    if (activeSearchMatchId !== null) {
+      const existingIdx = matches.indexOf(activeSearchMatchId);
+      if (existingIdx !== -1) {
+        activeMatchIndex = existingIdx;
+        return activeSearchMatchId;
+      }
+    }
+    const clampedIdx =
+      activeMatchIndex >= 0 && activeMatchIndex < matches.length
+        ? activeMatchIndex
+        : 0;
+    activeMatchIndex = clampedIdx;
+    activeSearchMatchId = matches[clampedIdx] ?? null;
+    return activeSearchMatchId;
+  };
 
   const updateConnectionStatus = (): void => {
     const isPaused = snapshot?.settings.paused ?? false;
@@ -333,6 +456,301 @@ function bootstrapPanel(): void {
     }
   };
 
+  const updateSearchControls = (vm: PanelViewModel): void => {
+    const isFilterMode = filter.queryMode === "filter";
+    searchModeBtn.textContent = isFilterMode ? "Filter" : "Highlight";
+    searchModeBtn.setAttribute("aria-pressed", String(isFilterMode));
+    searchModeBtn.title = isFilterMode
+      ? "Search mode: Filter graph to matches only (click to switch to Highlight)"
+      : "Search mode: Highlight matches in graph (click to switch to Filter)";
+
+    const parsed = parseQuery(filter.query);
+    const hasPositiveInclusions = parsed.inclusions.length > 0;
+    const totalMatches = vm.orderedMatchIds.length;
+
+    if (!hasPositiveInclusions) {
+      searchNavGroup.hidden = true;
+      searchMatchCountEl.textContent = "0/0";
+      searchMatchCountEl.classList.remove("is-no-match");
+      return;
+    }
+
+    searchNavGroup.hidden = false;
+    if (totalMatches > 0) {
+      const displayIdx = activeMatchIndex >= 0 ? activeMatchIndex + 1 : 1;
+      searchMatchCountEl.textContent = `${displayIdx}/${totalMatches}`;
+      searchMatchCountEl.classList.remove("is-no-match");
+      searchPrevBtn.disabled = false;
+      searchNextBtn.disabled = false;
+    } else {
+      searchMatchCountEl.textContent = "0/0";
+      searchMatchCountEl.classList.add("is-no-match");
+      searchPrevBtn.disabled = true;
+      searchNextBtn.disabled = true;
+    }
+  };
+
+  const updateTagsButton = (vm: PanelViewModel): void => {
+    const total = vm.tagInventory.length;
+    const excludedCount = vm.tagInventory.filter((t) => t.excluded).length;
+    const includedCount = vm.tagInventory.filter((t) => t.included).length;
+    const hasTagQuery =
+      listExcludedTags(filter.query).length > 0 ||
+      listIncludedTags(filter.query).length > 0;
+
+    if (hasTagQuery || excludedCount > 0 || includedCount > 0) {
+      tagsFilterBtn.dataset.active = "true";
+    } else {
+      delete tagsFilterBtn.dataset.active;
+    }
+
+    if (excludedCount > 0 && total > 0) {
+      tagsFilterBtn.textContent = `Tags (${total - excludedCount}/${total}) ▾`;
+    } else if (includedCount > 0) {
+      tagsFilterBtn.textContent = `Tags (${includedCount}) ▾`;
+    } else if (total > 0) {
+      tagsFilterBtn.textContent = `Tags (${total}) ▾`;
+    } else {
+      tagsFilterBtn.textContent = "Tags ▾";
+    }
+  };
+
+  const renderTagsPopover = (vm: PanelViewModel): void => {
+    const header = document.createElement("div");
+    header.className = "tags-popover-header";
+
+    const title = document.createElement("span");
+    title.className = "tags-popover-title";
+    title.textContent = "Web Component Tags";
+
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "tags-popover-reset";
+    resetBtn.textContent = "Show all";
+    const hasTagTokens =
+      listExcludedTags(filter.query).length > 0 ||
+      listIncludedTags(filter.query).length > 0;
+    resetBtn.disabled = !hasTagTokens;
+    resetBtn.addEventListener("click", () => {
+      const nextQuery = clearTagTokens(filter.query);
+      applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+    });
+
+    header.append(title, resetBtn);
+
+    const body = document.createElement("div");
+    body.className = "tags-popover-body";
+
+    if (vm.tagInventory.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "tags-empty";
+      empty.textContent = "No web component tags tracked yet.";
+      body.append(empty);
+      tagsPopover.replaceChildren(header, body);
+      return;
+    }
+
+    const includedTags = listIncludedTags(filter.query);
+    const allTagNames = vm.tagInventory.map((entry) => entry.tagName);
+    const filterByInclusions =
+      filter.queryMode === "filter" && includedTags.length > 0;
+    const isTagChecked = (entry: (typeof vm.tagInventory)[number]): boolean =>
+      !entry.excluded &&
+      (!filterByInclusions ||
+        includedTags.every((inc) => matchGlob(inc, entry.tagName)));
+
+    if (vm.prefixGroups.length > 0) {
+      const prefixHeading = document.createElement("div");
+      prefixHeading.className = "tags-section-label";
+      prefixHeading.textContent = "Prefixes";
+      body.append(prefixHeading);
+
+      for (const group of vm.prefixGroups) {
+        const row = document.createElement("div");
+        row.className = "tags-row";
+
+        const label = document.createElement("label");
+        label.className = "tags-toggle-label";
+
+        const groupEntries = vm.tagInventory.filter((entry) =>
+          matchGlob(group.prefix, entry.tagName),
+        );
+        const someHidden = groupEntries.some((entry) => !isTagChecked(entry));
+        const allHidden =
+          groupEntries.length > 0 &&
+          groupEntries.every((entry) => !isTagChecked(entry));
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.className = "tags-checkbox";
+        checkbox.checked = !allHidden;
+        checkbox.indeterminate = someHidden && !allHidden;
+        checkbox.addEventListener("change", () => {
+          if (filterByInclusions) {
+            const nextIncluded = vm.tagInventory
+              .filter((entry) =>
+                matchGlob(group.prefix, entry.tagName)
+                  ? checkbox.checked
+                  : isTagChecked(entry),
+              )
+              .map((entry) => entry.tagName);
+            const nextQuery = rewriteFieldInclusionsToExclusions(
+              filter.query,
+              "tag",
+              nextIncluded,
+              allTagNames,
+            );
+            applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+            return;
+          }
+          let nextQuery = setTagExcludedInQuery(
+            filter.query,
+            group.prefix,
+            !checkbox.checked,
+          );
+          if (checkbox.checked) {
+            for (const entry of groupEntries) {
+              nextQuery = setTagExcludedInQuery(
+                nextQuery,
+                entry.tagName,
+                false,
+                allTagNames,
+              );
+            }
+          }
+          applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+        });
+
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "tags-name";
+        nameSpan.textContent = group.prefix;
+
+        const countSpan = document.createElement("span");
+        countSpan.className = "tags-count";
+        countSpan.textContent = String(group.count);
+
+        label.append(checkbox, nameSpan, countSpan);
+
+        const onlyBtn = document.createElement("button");
+        onlyBtn.type = "button";
+        onlyBtn.className = "tags-only-btn";
+        onlyBtn.textContent = "Only";
+        const isOnly =
+          includedTags.length === 1 &&
+          includedTags[0]?.toLowerCase() === group.prefix.toLowerCase();
+        onlyBtn.setAttribute("aria-pressed", String(isOnly));
+        onlyBtn.addEventListener("click", () => {
+          const nextQuery = isOnly
+            ? clearTagTokens(filter.query)
+            : setTagOnlyInQuery(filter.query, group.prefix);
+          applyQueryUpdate(nextQuery, {
+            resetMatch: true,
+            fit: filter.queryMode === "filter",
+          });
+        });
+
+        row.append(label, onlyBtn);
+        body.append(row);
+      }
+    }
+
+    const tagsHeading = document.createElement("div");
+    tagsHeading.className = "tags-section-label";
+    tagsHeading.textContent = "Tags";
+    body.append(tagsHeading);
+
+    for (const entry of vm.tagInventory) {
+      const row = document.createElement("div");
+      row.className = "tags-row";
+
+      const label = document.createElement("label");
+      label.className = "tags-toggle-label";
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "tags-checkbox";
+      checkbox.checked = isTagChecked(entry);
+      checkbox.addEventListener("change", () => {
+        if (filterByInclusions) {
+          const nextIncluded = vm.tagInventory
+            .filter((t) =>
+              t.tagName.toLowerCase() === entry.tagName.toLowerCase()
+                ? checkbox.checked
+                : isTagChecked(t),
+            )
+            .map((t) => t.tagName);
+          const nextQuery = rewriteFieldInclusionsToExclusions(
+            filter.query,
+            "tag",
+            nextIncluded,
+            allTagNames,
+          );
+          applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+          return;
+        }
+        const nextQuery = setTagExcludedInQuery(
+          filter.query,
+          entry.tagName,
+          !checkbox.checked,
+          allTagNames,
+        );
+        applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+      });
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "tags-name";
+      nameSpan.textContent = `<${entry.tagName}>`;
+
+      const countSpan = document.createElement("span");
+      countSpan.className = "tags-count";
+      countSpan.textContent = String(entry.count);
+
+      label.append(checkbox, nameSpan, countSpan);
+
+      const onlyBtn = document.createElement("button");
+      onlyBtn.type = "button";
+      onlyBtn.className = "tags-only-btn";
+      onlyBtn.textContent = "Only";
+      const isOnly =
+        includedTags.length === 1 &&
+        includedTags[0]?.toLowerCase() === entry.tagName.toLowerCase();
+      onlyBtn.setAttribute("aria-pressed", String(isOnly));
+      onlyBtn.addEventListener("click", () => {
+        const nextQuery = isOnly
+          ? clearTagTokens(filter.query)
+          : setTagOnlyInQuery(filter.query, entry.tagName);
+        applyQueryUpdate(nextQuery, {
+          resetMatch: true,
+          fit: filter.queryMode === "filter",
+        });
+      });
+
+      row.append(label, onlyBtn);
+      body.append(row);
+    }
+
+    tagsPopover.replaceChildren(header, body);
+  };
+
+  const closeTagsPopover = (): void => {
+    if (tagsPopover.hidden) return;
+    tagsPopover.hidden = true;
+    tagsFilterBtn.setAttribute("aria-expanded", "false");
+  };
+
+  const openTagsPopover = (): void => {
+    const btnRect = tagsFilterBtn.getBoundingClientRect();
+    tagsPopover.classList.toggle(
+      "is-align-end",
+      btnRect.left + 260 > window.innerWidth,
+    );
+    tagsPopover.hidden = false;
+    tagsFilterBtn.setAttribute("aria-expanded", "true");
+    if (lastVm) {
+      renderTagsPopover(lastVm);
+    }
+  };
+
   const updateToolbarControls = (vm: PanelViewModel): void => {
     const paused = vm.snapshot?.settings.paused ?? false;
     const captureMemoHits = vm.snapshot?.settings.captureMemoHits ?? false;
@@ -355,6 +773,8 @@ function bootstrapPanel(): void {
       const kind = btn.dataset.kind;
       btn.setAttribute("aria-pressed", String(kind === filter.kindFilter));
     }
+
+    updateTagsButton(vm);
 
     if (vm.focusedNode) {
       focusBreadcrumb.hidden = false;
@@ -420,16 +840,60 @@ function bootstrapPanel(): void {
 
   const renderAll = (): void => {
     const vm = derivePanelViewModel(snapshot, filter, selectedNodeId);
+    lastVm = vm;
+    const matchId = reconcileActiveMatch(vm);
     updateConnectionStatus();
     updateToolbarControls(vm);
+    updateSearchControls(vm);
     updateEmptyState(vm);
-    graphView.render(vm);
+    if (!tagsPopover.hidden) {
+      renderTagsPopover(vm);
+    }
+    graphView.render(vm, matchId);
     inspectorView.render(vm);
     waterfallView.render(
       vm,
       filter.traceCategory,
       filter.followSelectionInTraces,
     );
+  };
+
+  const applyQueryUpdate = (
+    nextQuery: string,
+    options: { readonly resetMatch: boolean; readonly fit: boolean },
+  ): void => {
+    if (searchInput.value !== nextQuery) {
+      searchInput.value = nextQuery;
+    }
+    if (options.resetMatch) {
+      activeMatchIndex = 0;
+      activeSearchMatchId = null;
+    }
+    filter = { ...filter, query: nextQuery };
+    renderAll();
+    if (options.fit) {
+      graphView.fit();
+    }
+  };
+
+  const stepSearchMatch = (delta: 1 | -1): void => {
+    const matches = lastVm?.orderedMatchIds ?? [];
+    if (matches.length === 0) return;
+    const baseIndex = activeMatchIndex < 0 ? 0 : activeMatchIndex;
+    const nextIndex = (baseIndex + delta + matches.length) % matches.length;
+    activeMatchIndex = nextIndex;
+    activeSearchMatchId = matches[nextIndex] ?? null;
+    renderAll();
+    if (activeSearchMatchId !== null) {
+      graphView.centerOnNode(activeSearchMatchId);
+    }
+  };
+
+  const clearSearch = (): void => {
+    applyQueryUpdate("", {
+      resetMatch: true,
+      fit: filter.queryMode === "filter",
+    });
   };
 
   const stopHandshakeRetry = (): void => {
@@ -524,13 +988,73 @@ function bootstrapPanel(): void {
 
   const unsubscribe = transport.onMessage(onTransportMessage);
 
-  // Wire toolbar controls
+  // Wire search controls
   searchInput.addEventListener("input", () => {
-    filter = { ...filter, query: searchInput.value };
+    applyQueryUpdate(searchInput.value, {
+      resetMatch: true,
+      fit: filter.queryMode === "filter",
+    });
+  });
+
+  searchInput.addEventListener("keydown", (evt) => {
+    if (evt.ctrlKey || evt.metaKey || evt.altKey) return;
+    if (evt.key === "Enter") {
+      evt.preventDefault();
+      stepSearchMatch(evt.shiftKey ? -1 : 1);
+    } else if (evt.key === "Escape") {
+      if (searchInput.value.length > 0) {
+        evt.preventDefault();
+        clearSearch();
+      } else {
+        searchInput.blur();
+      }
+    }
+  });
+
+  searchModeBtn.addEventListener("click", () => {
+    filter = {
+      ...filter,
+      queryMode: filter.queryMode === "highlight" ? "filter" : "highlight",
+    };
     renderAll();
     graphView.fit();
   });
 
+  searchPrevBtn.addEventListener("click", () => stepSearchMatch(-1));
+  searchNextBtn.addEventListener("click", () => stepSearchMatch(1));
+  searchClearBtn.addEventListener("click", () => {
+    clearSearch();
+    searchInput.focus();
+  });
+
+  // Wire Tags popover
+  tagsFilterBtn.addEventListener("click", () => {
+    if (tagsPopover.hidden) {
+      openTagsPopover();
+    } else {
+      closeTagsPopover();
+    }
+  });
+
+  tagsPopover.addEventListener("keydown", (evt) => {
+    if (evt.key === "Escape") {
+      evt.preventDefault();
+      evt.stopPropagation();
+      closeTagsPopover();
+      tagsFilterBtn.focus();
+    }
+  });
+
+  const onDocumentPointerDown = (evt: PointerEvent): void => {
+    if (tagsPopover.hidden) return;
+    const target = evt.target;
+    if (target instanceof Node && !tagsDropdownWrap.contains(target)) {
+      closeTagsPopover();
+    }
+  };
+  document.addEventListener("pointerdown", onDocumentPointerDown);
+
+  // Wire toolbar filter controls
   kindFilterGroup.addEventListener("click", (evt) => {
     const target = evt.target;
     if (!(target instanceof Element)) return;
@@ -592,8 +1116,14 @@ function bootstrapPanel(): void {
   emptyScanBtn.addEventListener("click", triggerScanDom);
 
   emptyResetBtn.addEventListener("click", () => {
-    filter = { ...DEFAULT_FILTER_STATE };
+    filter = {
+      ...DEFAULT_FILTER_STATE,
+      expandedMemoOwnerIds: new Set(),
+    };
     searchInput.value = "";
+    activeMatchIndex = -1;
+    activeSearchMatchId = null;
+    closeTagsPopover();
     renderAll();
     graphView.fit();
   });
@@ -617,55 +1147,85 @@ function bootstrapPanel(): void {
   zoomInBtn.addEventListener("click", () => graphView.zoomIn());
   zoomOutBtn.addEventListener("click", () => graphView.zoomOut());
 
+  restoreBottomBtn.addEventListener("click", () => {
+    paneLayout?.setBottomCollapsed(false);
+  });
+
   themeBtn.addEventListener("click", () => {
-    themePreference =
-      themePreference === "auto"
-        ? "dark"
-        : themePreference === "dark"
-          ? "light"
-          : "auto";
-    writeStoredTheme(themePreference);
-    applyTheme();
+    themeController.cycle();
   });
 
   tabInspectorBtn.addEventListener("click", () => setActiveTab("inspector"));
   tabWaterfallBtn.addEventListener("click", () => setActiveTab("waterfall"));
 
-  const onKeyDown = (evt: KeyboardEvent) => {
-    if (evt.defaultPrevented) return;
-    const active = document.activeElement;
-    const isTyping =
-      active instanceof HTMLInputElement ||
-      active instanceof HTMLTextAreaElement ||
-      active instanceof HTMLSelectElement;
-
-    if (
-      evt.key === "/" &&
-      !isTyping &&
-      !evt.metaKey &&
-      !evt.ctrlKey &&
-      !evt.altKey
-    ) {
-      evt.preventDefault();
+  const disposeShortcuts = registerPanelShortcuts(window, {
+    onSearch: () => {
       searchInput.focus();
       searchInput.select();
-    } else if (
-      evt.key === "Escape" &&
-      !isTyping &&
-      filter.focusSubgraphNodeId !== null
-    ) {
-      evt.preventDefault();
-      filter = { ...filter, focusSubgraphNodeId: null };
-      renderAll();
+    },
+    onEscape: () => {
+      if (!tagsPopover.hidden) {
+        closeTagsPopover();
+        return true;
+      }
+      if (filter.focusSubgraphNodeId !== null) {
+        filter = { ...filter, focusSubgraphNodeId: null };
+        renderAll();
+        return true;
+      }
+      if (selectedNodeId !== null) {
+        selectedNodeId = null;
+        renderAll();
+        return true;
+      }
+      return false;
+    },
+    onFit: () => graphView.fit(),
+    onZoomIn: () => graphView.zoomIn(),
+    onZoomOut: () => graphView.zoomOut(),
+  });
+
+  const handleDevtoolsSearch = (action: string, query?: string): void => {
+    switch (action) {
+      case "performSearch": {
+        applyQueryUpdate(query ?? "", {
+          resetMatch: true,
+          fit: filter.queryMode === "filter",
+        });
+        if (filter.queryMode === "highlight" && activeSearchMatchId !== null) {
+          graphView.centerOnNode(activeSearchMatchId);
+        }
+        break;
+      }
+      case "nextSearchResult":
+        stepSearchMatch(1);
+        break;
+      case "previousSearchResult":
+        stepSearchMatch(-1);
+        break;
+      case "cancelSearch":
+        clearSearch();
+        break;
     }
   };
-  window.addEventListener("keydown", onKeyDown);
 
-  const colorSchemeMedia = window.matchMedia?.("(prefers-color-scheme: dark)");
-  const onColorSchemeChange = () => {
-    if (themePreference === "auto") applyTheme();
-  };
-  colorSchemeMedia?.addEventListener("change", onColorSchemeChange);
+  Reflect.set(window, "__LIT_FLOW_ON_SEARCH__", handleDevtoolsSearch);
+
+  const pendingSearchRaw: unknown = Reflect.get(
+    window,
+    "__LIT_FLOW_PENDING_SEARCH__",
+  );
+  if (pendingSearchRaw !== null && typeof pendingSearchRaw === "object") {
+    const action: unknown = Reflect.get(pendingSearchRaw, "action");
+    const queryString: unknown = Reflect.get(pendingSearchRaw, "queryString");
+    Reflect.deleteProperty(window, "__LIT_FLOW_PENDING_SEARCH__");
+    if (typeof action === "string") {
+      handleDevtoolsSearch(
+        action,
+        typeof queryString === "string" ? queryString : undefined,
+      );
+    }
+  }
 
   const cleanup = (): void => {
     stopHandshakeRetry();
@@ -673,8 +1233,11 @@ function bootstrapPanel(): void {
       clearTimeout(toastTimer);
       toastTimer = null;
     }
-    window.removeEventListener("keydown", onKeyDown);
-    colorSchemeMedia?.removeEventListener("change", onColorSchemeChange);
+    disposeShortcuts();
+    document.removeEventListener("pointerdown", onDocumentPointerDown);
+    Reflect.deleteProperty(window, "__LIT_FLOW_ON_SEARCH__");
+    themeController.dispose();
+    paneLayout?.dispose();
     sendHoverHighlight(null);
     unsubscribe();
     graphView.dispose();
@@ -684,7 +1247,6 @@ function bootstrapPanel(): void {
   window.addEventListener("pagehide", cleanup);
 
   // Initial paint + resilient bootstrap handshake
-  applyTheme();
   setActiveTab("inspector");
   renderAll();
 

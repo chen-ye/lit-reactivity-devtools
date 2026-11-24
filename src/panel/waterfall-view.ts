@@ -13,6 +13,7 @@ export interface WaterfallViewCallbacks {
   readonly onTraceCategoryChange: (category: TraceCategoryFilter) => void;
   readonly onToggleFollowSelection: () => void;
   readonly onClearEvents: () => void;
+  readonly onToggleBottomCollapse?: () => void;
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -108,6 +109,7 @@ export class WaterfallView {
   readonly #modeCascadesBtn: HTMLButtonElement;
   readonly #modeFlatBtn: HTMLButtonElement;
   readonly #selectedOnlyBtn: HTMLButtonElement;
+  readonly #collapseBtn: HTMLButtonElement;
   readonly #metaEl: HTMLDivElement;
   readonly #categoryButtons = new Map<TraceCategoryFilter, HTMLButtonElement>();
   readonly #collapsedCascades = new Set<number>();
@@ -182,6 +184,19 @@ export class WaterfallView {
       this.#callbacks.onClearEvents();
     });
 
+    this.#collapseBtn = el(
+      "button",
+      "tool-btn waterfall-collapse-btn",
+      "▾ Collapse",
+    );
+    this.#collapseBtn.type = "button";
+    this.#collapseBtn.dataset.testid = "collapse-bottom-btn";
+    this.#collapseBtn.title = "Collapse timeline pane";
+    this.#collapseBtn.setAttribute("aria-expanded", "true");
+    this.#collapseBtn.addEventListener("click", () => {
+      this.#callbacks.onToggleBottomCollapse?.();
+    });
+
     this.#metaEl = el("div", "waterfall-meta");
 
     const sep1 = el("span", "toolbar-sep");
@@ -197,10 +212,19 @@ export class WaterfallView {
       this.#selectedOnlyBtn,
       this.#metaEl,
       clearBtn,
+      this.#collapseBtn,
     );
 
     this.#bodyEl = el("div", "waterfall-body");
     this.#container.replaceChildren(header, this.#bodyEl);
+  }
+
+  setBottomCollapsed(collapsed: boolean): void {
+    this.#collapseBtn.setAttribute("aria-expanded", String(!collapsed));
+    this.#collapseBtn.title = collapsed
+      ? "Expand timeline pane"
+      : "Collapse timeline pane";
+    this.#collapseBtn.textContent = collapsed ? "▴ Expand" : "▾ Collapse";
   }
 
   render(

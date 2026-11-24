@@ -4,9 +4,10 @@ import type {
   ReactivePropertySnapshot,
   ReactivityEdgeSnapshot,
   ReactivityNodeSnapshot,
+  SourceLocation,
   ValuePreview,
 } from "../protocol/types.ts";
-import type { PanelViewModel } from "./graph-state.ts";
+import { getNodeTagName, type PanelViewModel } from "./graph-state.ts";
 
 export interface InspectorViewCallbacks {
   readonly transportMode: "devtools" | "bridge";
@@ -20,11 +21,19 @@ export interface InspectorViewCallbacks {
   readonly onClearMemoCache: (nodeId: number) => void;
   readonly onRevealInElements: (nodeId: number) => void;
   readonly onLogNode: (nodeId: number) => void;
+  readonly onOpenSource?: (
+    nodeId: number,
+    site: SourceLocation | null,
+    propName?: string | null,
+  ) => void;
+  readonly onHideTag?: (tagName: string, nextExcluded?: boolean) => void;
+  readonly onToggleMemoCluster?: (ownerId: number) => void;
 }
 
 interface PropRowRefs {
   readonly row: HTMLDivElement;
   readonly changesEl: HTMLSpanElement;
+  readonly jumpBtn: HTMLButtonElement;
   readonly valuesEl: HTMLDivElement;
   readonly sourceEl: HTMLDivElement;
   readonly entriesHost: HTMLDivElement;
@@ -122,6 +131,7 @@ export class InspectorView {
   readonly #callbacks: InspectorViewCallbacks;
 
   #renderedNodeId: number | null = null;
+  #currentNodeSite: SourceLocation | null = null;
   #headerHost: HTMLElement | null = null;
   #actionBannerHost: HTMLDivElement | null = null;
   #errorHost: HTMLDivElement | null = null;
@@ -167,6 +177,7 @@ export class InspectorView {
     const node = vm.selectedNode;
     if (!node) {
       this.#renderedNodeId = null;
+      this.#currentNodeSite = null;
       this.#clearStructuralRefs();
       this.#renderEmpty(vm);
       return;
@@ -180,7 +191,8 @@ export class InspectorView {
       this.#mountNodeScaffold();
     }
 
-    this.#patchHeader(node, vm.focusedNode?.id === node.id);
+    this.#currentNodeSite = node.site;
+    this.#patchHeader(node, vm.focusedNode?.id === node.id, vm);
     this.#patchActionBanner(node.id);
     this.#patchError(node);
     this.#patchMetrics(node, vm);
@@ -363,22 +375,64 @@ export class InspectorView {
     }
   }
 
-  #patchHeader(node: ReactivityNodeSnapshot, isFocusedRoot: boolean): void {
+  #patchHeader(
+    node: ReactivityNodeSnapshot,
+    isFocusedRoot: boolean,
+    vm: PanelViewModel,
+  ): void {
     if (!this.#headerHost) return;
-    const headerKey = `${node.id}|${node.kind}|${node.label}|${node.subtitle ?? ""}|${node.connected}|${node.rootType ?? ""}|${node.vetoes}|${node.error ?? ""}|${isFocusedRoot}|${node.site?.file ?? ""}:${node.site?.line ?? 0}|${this.#callbacks.transportMode}`;
+    const tagName = node.kind === "element" ? getNodeTagName(node) : null;
+    const tagEntry = tagName
+      ? (vm.tagInventory.find((t) => t.tagName === tagName) ?? null)
+      : null;
+    const isTagExcluded = tagEntry?.excluded ?? false;
+    const ownedCluster =
+      vm.layout.clusters?.find((c) => c.ownerId === node.id) ?? null;
+
+    const headerKey = [
+      node.id,
+      node.kind,
+      node.label,
+      node.subtitle ?? "",
+      node.disambiguator ?? "",
+      tagName ?? "",
+      isTagExcluded ? "1" : "0",
+      ownedCluster
+        ? `${ownedCluster.hiddenCount}:${ownedCluster.expanded ? 1 : 0}`
+        : "",
+      node.connected ? "1" : "0",
+      node.rootType ?? "",
+      node.vetoes,
+      node.error ?? "",
+      isFocusedRoot ? "1" : "0",
+      node.site?.file ?? "",
+      node.site?.line ?? 0,
+      node.site?.column ?? 0,
+      node.site?.fn ?? "",
+      this.#callbacks.transportMode,
+      this.#callbacks.onOpenSource ? "1" : "0",
+    ].join("\u0001");
     if (headerKey === this.#lastHeaderKey) return;
     this.#lastHeaderKey = headerKey;
 
+    const titleText = formatNodeTitle(node);
     const titleRow = el("div", "inspector-title-row");
     titleRow.append(
       el("span", `kind-badge kind-${node.kind}`, formatKindLabel(node.kind)),
-      el("h2", "inspector-title", formatNodeTitle(node)),
+      el("h2", "inspector-title", titleText),
       el("span", "inspector-id", `#${node.id}`),
     );
 
     const metaRow = el("div", "inspector-meta-row");
     if (node.subtitle) {
       metaRow.append(el("span", undefined, node.subtitle));
+    }
+    if (
+      node.disambiguator &&
+      !titleText.includes(node.disambiguator) &&
+      !(node.subtitle?.includes(node.disambiguator) ?? false)
+    ) {
+      metaRow.append(el("span", "meta-tag", node.disambiguator));
     }
     if (node.kind === "element" || node.kind === "controller") {
       metaRow.append(
@@ -436,6 +490,30 @@ export class InspectorView {
       actions.append(revealBtn);
     }
 
+    if (
+      node.site !== null ||
+      node.kind === "element" ||
+      node.kind === "controller" ||
+      node.kind === "model" ||
+      node.kind === "computed" ||
+      node.kind === "observer" ||
+      node.kind === "context"
+    ) {
+      const openSourceBtn = el("button", "tool-btn", "Open Source");
+      openSourceBtn.type = "button";
+      openSourceBtn.dataset.testid = "open-source-btn";
+      if (this.#callbacks.transportMode === "bridge" && node.site === null) {
+        openSourceBtn.disabled = true;
+        openSourceBtn.title = "No source location available";
+      } else {
+        openSourceBtn.title = "Open definition in Sources";
+      }
+      openSourceBtn.addEventListener("click", () => {
+        this.#callbacks.onOpenSource?.(node.id, node.site, null);
+      });
+      actions.append(openSourceBtn);
+    }
+
     if (node.kind === "computed" || node.kind === "observer") {
       const clearBtn = el("button", "tool-btn", "Clear memo cache");
       clearBtn.type = "button";
@@ -444,6 +522,38 @@ export class InspectorView {
         this.#callbacks.onClearMemoCache(node.id);
       });
       actions.append(clearBtn);
+    }
+
+    if (ownedCluster) {
+      const clusterLabel = ownedCluster.expanded
+        ? `Collapse ${ownedCluster.hiddenCount} memos`
+        : `Expand ${ownedCluster.hiddenCount} memos`;
+      const clusterBtn = el("button", "tool-btn", clusterLabel);
+      clusterBtn.type = "button";
+      clusterBtn.dataset.testid = "toggle-memo-cluster-btn";
+      clusterBtn.setAttribute("aria-pressed", String(ownedCluster.expanded));
+      clusterBtn.addEventListener("click", () => {
+        this.#callbacks.onToggleMemoCluster?.(node.id);
+      });
+      actions.append(clusterBtn);
+    }
+
+    if (node.kind === "element" && tagName) {
+      const hideTagBtn = el(
+        "button",
+        "tool-btn",
+        isTagExcluded ? `Show ${tagName}` : `Hide ${tagName}`,
+      );
+      hideTagBtn.type = "button";
+      hideTagBtn.dataset.testid = "toggle-hide-tag-btn";
+      hideTagBtn.setAttribute("aria-pressed", String(isTagExcluded));
+      hideTagBtn.title = isTagExcluded
+        ? `Remove -tag:${tagName} filter`
+        : `Hide <${tagName}> nodes from graph`;
+      hideTagBtn.addEventListener("click", () => {
+        this.#callbacks.onHideTag?.(tagName, !isTagExcluded);
+      });
+      actions.append(hideTagBtn);
     }
 
     const logBtn = el("button", "tool-btn", "Log as $lit");
@@ -464,13 +574,21 @@ export class InspectorView {
     if (metaRow.childElementCount > 0) children.push(metaRow);
     if (node.site) {
       const fnSuffix = node.site.fn ? ` · ${node.site.fn}` : "";
-      const siteEl = el(
-        "div",
-        "inspector-site",
-        `${node.site.file}:${node.site.line}:${node.site.column}${fnSuffix}`,
-      );
-      siteEl.title = siteEl.textContent;
-      children.push(siteEl);
+      const siteText = `${node.site.file}:${node.site.line}:${node.site.column}${fnSuffix}`;
+      if (this.#callbacks.onOpenSource) {
+        const siteBtn = el("button", "inspector-site-btn", siteText);
+        siteBtn.type = "button";
+        siteBtn.dataset.testid = "inspector-site-btn";
+        siteBtn.title = `Open ${siteText} in Sources`;
+        siteBtn.addEventListener("click", () => {
+          this.#callbacks.onOpenSource?.(node.id, node.site, null);
+        });
+        children.push(siteBtn);
+      } else {
+        const siteEl = el("div", "inspector-site", siteText);
+        siteEl.title = siteText;
+        children.push(siteEl);
+      }
     }
     children.push(actions);
     this.#headerHost.replaceChildren(...children);
@@ -662,7 +780,18 @@ export class InspectorView {
     }
 
     const changesEl = el("span", "prop-changes");
-    head.append(changesEl);
+    const jumpBtn = el("button", "prop-jump-btn", "↗");
+    jumpBtn.type = "button";
+    jumpBtn.title = "Open property definition in Sources";
+    jumpBtn.dataset.testid = `prop-source-${prop.name}`;
+    jumpBtn.setAttribute(
+      "aria-label",
+      `Open definition of property ${prop.name} in Sources`,
+    );
+    jumpBtn.addEventListener("click", () => {
+      this.#callbacks.onOpenSource?.(nodeId, this.#currentNodeSite, prop.name);
+    });
+    head.append(changesEl, jumpBtn);
 
     const valuesEl = el("div", "prop-values");
     const entriesHost = el("div");
@@ -714,6 +843,7 @@ export class InspectorView {
     return {
       row,
       changesEl,
+      jumpBtn,
       valuesEl,
       sourceEl,
       entriesHost,
@@ -729,6 +859,13 @@ export class InspectorView {
     refs: PropRowRefs,
   ): void {
     refs.changesEl.textContent = `${prop.changes}×`;
+    const bridgeNoSite =
+      this.#callbacks.transportMode === "bridge" &&
+      this.#currentNodeSite === null;
+    refs.jumpBtn.disabled = bridgeNoSite;
+    refs.jumpBtn.title = bridgeNoSite
+      ? "No source location available"
+      : "Open property definition in Sources";
 
     const valueNodes: Node[] = [];
     if (prop.prevValue !== null) {
@@ -787,7 +924,14 @@ export class InspectorView {
 
   #patchValueAndArgs(node: ReactivityNodeSnapshot): void {
     if (!this.#valueHost) return;
-    const valueKey = `${node.value?.kind ?? ""}|${node.value?.text ?? ""}|${node.value?.entries?.length ?? 0}|${node.lastArgs?.map((a) => a.text).join("\u0001") ?? ""}`;
+    const valueKey = [
+      node.value?.kind ?? "",
+      node.value?.text ?? "",
+      node.value?.entries?.map(([k, v]) => `${k}=${v}`).join("\u0001") ?? "",
+      node.lastArgs?.map((a) => a.text).join("\u0001") ?? "",
+      node.computeSignature ?? "",
+      node.computeSource ?? "",
+    ].join("\u0002");
     if (valueKey === this.#lastValueKey) return;
     this.#lastValueKey = valueKey;
     const sections: HTMLElement[] = [];
@@ -831,6 +975,23 @@ export class InspectorView {
         box.append(line);
       }
       section.append(box);
+      sections.push(section);
+    }
+
+    if (node.computeSource || node.computeSignature) {
+      const section = el("section", "inspector-section");
+      section.dataset.testid = "compute-expression-section";
+      const heading = el("h3", "section-heading", "Compute Expression");
+      if (node.computeSignature) {
+        heading.append(el("span", "meta-tag", node.computeSignature));
+      }
+      section.append(heading);
+
+      const pre = el("pre", "compute-source-code");
+      const code = el("code");
+      code.textContent = node.computeSource ?? node.computeSignature ?? "";
+      pre.append(code);
+      section.append(pre);
       sections.push(section);
     }
 

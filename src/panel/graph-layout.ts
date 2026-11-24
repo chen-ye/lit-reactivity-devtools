@@ -4,12 +4,76 @@ import type {
   ReactivityEdgeSnapshot,
   ReactivityNodeSnapshot,
 } from "../protocol/types.ts";
+import {
+  computeHierarchicLayout,
+  type LayoutEdgeInput,
+  type LayoutNodeInput,
+  type LayoutPoint,
+} from "../shared/hierarchic-layout.ts";
+import {
+  formatSemanticTitle,
+  smartTruncateToPx,
+  splitTwoLineTitle,
+  type TwoLineTitle,
+} from "../shared/label-format.ts";
+import { measureTextPx } from "../shared/text-measure.ts";
 
 export const NODE_WIDTH = 238;
 export const NODE_HEIGHT = 76;
 export const LAYER_GAP = 148;
 export const ROW_GAP = 24;
 export const CANVAS_PADDING = 40;
+
+const MIN_CARD_WIDTH = 224;
+const MAX_CARD_WIDTH = 296;
+const COMPACT_MEMO_HEIGHT = 52;
+const TALL_CARD_HEIGHT = 90;
+const DEFAULT_MEMO_COLLAPSE_THRESHOLD = 4;
+const DEFAULT_BUS_THRESHOLD = 5;
+
+const TITLE_FONT =
+  '600 11.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
+const SUB_FONT =
+  '500 10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
+const EDGE_FONT =
+  '500 9.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
+
+export interface MemoClusterInfo {
+  readonly clusterNodeId: number;
+  readonly ownerId: number;
+  readonly ownerLabel: string;
+  readonly memberIds: ReadonlyArray<number>;
+  readonly memberNodes: ReadonlyArray<ReactivityNodeSnapshot>;
+  readonly computedCount: number;
+  readonly observerCount: number;
+  readonly hiddenCount: number;
+  readonly expanded: boolean;
+}
+
+export interface BusTrunkSegment {
+  readonly busGroupKey: string;
+  readonly layerIndex: number;
+  readonly sourceId: number;
+  readonly kind: EdgeKind;
+  readonly x: number;
+  readonly yStart: number;
+  readonly yEnd: number;
+  readonly path: string;
+  readonly memberEdgeIds: ReadonlyArray<string>;
+}
+
+export interface BusJunctionPoint {
+  readonly x: number;
+  readonly y: number;
+  readonly kind: EdgeKind;
+  readonly busGroupKey?: string;
+}
+
+export interface LitLayoutOptions {
+  readonly expandedMemoOwnerIds?: ReadonlySet<number>;
+  readonly memoCollapseThreshold?: number;
+  readonly busThreshold?: number;
+}
 
 export interface PositionedNode {
   readonly node: ReactivityNodeSnapshot;
@@ -19,6 +83,11 @@ export interface PositionedNode {
   readonly y: number;
   readonly width: number;
   readonly height: number;
+  readonly isCompactMemo?: boolean;
+  readonly isIsolated?: boolean;
+  readonly clusterInfo?: MemoClusterInfo;
+  readonly formattedTitle?: string;
+  readonly formattedTitleLines?: TwoLineTitle;
 }
 
 export interface RoutedEdge {
@@ -31,6 +100,10 @@ export interface RoutedEdge {
   readonly labelX: number;
   readonly labelY: number;
   readonly isFeedback: boolean;
+  readonly points?: ReadonlyArray<LayoutPoint>;
+  readonly reversed?: boolean;
+  readonly busGroupKey?: string | null;
+  readonly isBusMember?: boolean;
 }
 
 export interface GraphLayout {
@@ -40,6 +113,9 @@ export interface GraphLayout {
   readonly width: number;
   readonly height: number;
   readonly layerCount: number;
+  readonly clusters?: ReadonlyArray<MemoClusterInfo>;
+  readonly busTrunks?: ReadonlyArray<BusTrunkSegment>;
+  readonly junctions?: ReadonlyArray<BusJunctionPoint>;
 }
 
 const KIND_ORDER: Record<NodeKind, number> = {
@@ -50,6 +126,32 @@ const KIND_ORDER: Record<NodeKind, number> = {
   computed: 4,
   observer: 5,
 };
+
+const EDGE_PRIORITY: Record<EdgeKind, number> = {
+  "model-to-controller": 10,
+  "controller-to-element": 9,
+  "context-provide": 8,
+  "context-consume": 7,
+  "prop-flow": 6,
+  "memo-compute": 5,
+  "memo-observe": 4,
+  "event-emit": -10,
+};
+
+const DEFAULT_EDGE_LABELS: Record<EdgeKind, string> = {
+  "model-to-controller": "model-update",
+  "controller-to-element": "viewModel",
+  "prop-flow": "prop-flow",
+  "context-provide": "provide",
+  "context-consume": "context",
+  "memo-compute": "memo",
+  "memo-observe": "memo",
+  "event-emit": "event-emit",
+};
+
+function clamp(min: number, max: number, value: number): number {
+  return Math.max(min, Math.min(max, value));
+}
 
 function coalesceParallelEdges(
   edges: ReadonlyArray<ReactivityEdgeSnapshot>,
@@ -116,9 +218,40 @@ function coalesceParallelEdges(
   return merged;
 }
 
+function estimateEdgeLabelWidth(edge: ReactivityEdgeSnapshot): number {
+  const raw = edge.label ?? DEFAULT_EDGE_LABELS[edge.kind];
+  const withCount = edge.count > 1 ? `${raw} ×${edge.count}` : raw;
+  const singleLine = withCount.replace(/\s+/g, " ").trim();
+  const display =
+    singleLine.length <= 22 ? singleLine : `${singleLine.slice(0, 21)}…`;
+  return Math.max(36, Math.round(measureTextPx(display, EDGE_FONT) + 14));
+}
+
+function buildDisplayTitle(node: ReactivityNodeSnapshot): {
+  readonly displayText: string;
+  readonly disambiguator: string | null;
+} {
+  if (node.kind === "element") {
+    const baseTag = node.tagName || node.label;
+    const bracketed = baseTag.startsWith("<") ? baseTag : `<${baseTag}>`;
+    return {
+      displayText: bracketed,
+      disambiguator: node.disambiguator ?? null,
+    };
+  }
+  const semantic = formatSemanticTitle(node.label, {
+    disambiguator: node.disambiguator ?? null,
+  });
+  return {
+    displayText: semantic.title,
+    disambiguator: semantic.disambiguator,
+  };
+}
+
 export function computeGraphLayout(
   nodes: ReadonlyArray<ReactivityNodeSnapshot>,
   edges: ReadonlyArray<ReactivityEdgeSnapshot>,
+  options?: LitLayoutOptions,
 ): GraphLayout {
   if (nodes.length === 0) {
     return {
@@ -128,19 +261,20 @@ export function computeGraphLayout(
       width: CANVAS_PADDING * 2,
       height: CANVAS_PADDING * 2,
       layerCount: 0,
+      clusters: [],
+      busTrunks: [],
+      junctions: [],
     };
   }
 
-  const nodeMap = new Map<number, ReactivityNodeSnapshot>();
-  const outgoing = new Map<number, number[]>();
-  const incoming = new Map<number, number[]>();
-  const inDegree = new Map<number, number>();
+  const memoCollapseThreshold =
+    options?.memoCollapseThreshold ?? DEFAULT_MEMO_COLLAPSE_THRESHOLD;
+  const busThreshold = options?.busThreshold ?? DEFAULT_BUS_THRESHOLD;
+  const expandedMemoOwnerIds = options?.expandedMemoOwnerIds;
 
+  const nodeMap = new Map<number, ReactivityNodeSnapshot>();
   for (const node of nodes) {
     nodeMap.set(node.id, node);
-    outgoing.set(node.id, []);
-    incoming.set(node.id, []);
-    inDegree.set(node.id, 0);
   }
 
   const filteredEdges: ReactivityEdgeSnapshot[] = [];
@@ -149,311 +283,450 @@ export function computeGraphLayout(
     if (!nodeMap.has(edge.sourceId) || !nodeMap.has(edge.targetId)) continue;
     filteredEdges.push(edge);
   }
-
   const coalescedEdges = coalesceParallelEdges(filteredEdges);
 
+  // Build forward adjacency to identify leaf memos and owners
+  const forwardInByNode = new Map<number, ReactivityEdgeSnapshot[]>();
+  const forwardOutByNode = new Map<number, ReactivityEdgeSnapshot[]>();
+  const eventCountByNode = new Map<number, number>();
+  for (const node of nodes) {
+    forwardInByNode.set(node.id, []);
+    forwardOutByNode.set(node.id, []);
+    eventCountByNode.set(node.id, 0);
+  }
   for (const edge of coalescedEdges) {
-    if (edge.kind !== "event-emit") {
-      outgoing.get(edge.sourceId)?.push(edge.targetId);
-      incoming.get(edge.targetId)?.push(edge.sourceId);
-      inDegree.set(edge.targetId, (inDegree.get(edge.targetId) ?? 0) + 1);
+    if (edge.kind === "event-emit") {
+      eventCountByNode.set(
+        edge.sourceId,
+        (eventCountByNode.get(edge.sourceId) ?? 0) + 1,
+      );
+      continue;
     }
+    forwardOutByNode.get(edge.sourceId)?.push(edge);
+    forwardInByNode.get(edge.targetId)?.push(edge);
   }
 
-  // Kahn's topological sort over forward dataflow edges (excludes event-emit feedback edges)
-  const layerById = new Map<number, number>();
-  const queue: number[] = [];
+  const inferredOwnerByMemoId = new Map<number, number>();
+  const leafMemosByOwner = new Map<number, ReactivityNodeSnapshot[]>();
+  const leafMemoIds = new Set<number>();
 
   for (const node of nodes) {
-    if ((inDegree.get(node.id) ?? 0) === 0) {
-      queue.push(node.id);
-      layerById.set(node.id, 0);
-    }
-  }
-  queue.sort((a, b) => compareNodes(nodeMap.get(a)!, nodeMap.get(b)!));
+    if (node.kind !== "computed" && node.kind !== "observer") continue;
 
-  const processed = new Set<number>();
-  let cursor = 0;
-  while (cursor < queue.length) {
-    const id = queue[cursor++]!;
-    processed.add(id);
-    const currentLayer = layerById.get(id) ?? 0;
-
-    for (const targetId of outgoing.get(id) ?? []) {
-      const nextLayer = Math.max(
-        layerById.get(targetId) ?? 0,
-        currentLayer + 1,
-      );
-      layerById.set(targetId, nextLayer);
-      const deg = (inDegree.get(targetId) ?? 0) - 1;
-      inDegree.set(targetId, deg);
-      if (deg === 0) {
-        queue.push(targetId);
-      }
-    }
-  }
-
-  // Cycle-breaking fallback for unexpected forward cycles
-  if (processed.size < nodes.length) {
-    const remaining = nodes
-      .filter((n) => !processed.has(n.id))
-      .toSorted(compareNodes);
-    for (const node of remaining) {
-      let maxIn = -1;
-      for (const srcId of incoming.get(node.id) ?? []) {
-        const srcLayer = layerById.get(srcId);
-        if (srcLayer !== undefined && srcLayer > maxIn) {
-          maxIn = srcLayer;
+    let ownerId: number | null = null;
+    if (node.ownerNodeId !== undefined && nodeMap.has(node.ownerNodeId)) {
+      ownerId = node.ownerNodeId;
+    } else {
+      const ins = forwardInByNode.get(node.id) ?? [];
+      const memoInSources = new Set<number>();
+      let hasNonMemoIncoming = false;
+      for (const e of ins) {
+        if (e.kind === "memo-compute" || e.kind === "memo-observe") {
+          memoInSources.add(e.sourceId);
+        } else {
+          hasNonMemoIncoming = true;
         }
       }
-      layerById.set(node.id, maxIn + 1);
+      if (!hasNonMemoIncoming && memoInSources.size === 1) {
+        ownerId = memoInSources.values().next().value ?? null;
+      }
+    }
+
+    if (ownerId === null || ownerId === node.id || !nodeMap.has(ownerId)) {
+      continue;
+    }
+    inferredOwnerByMemoId.set(node.id, ownerId);
+
+    const outs = forwardOutByNode.get(node.id) ?? [];
+    const ins = forwardInByNode.get(node.id) ?? [];
+    const externalIn = ins.some((e) => e.sourceId !== ownerId);
+    const emitsEvents = (eventCountByNode.get(node.id) ?? 0) > 0;
+    if (outs.length === 0 && !externalIn && !emitsEvents) {
+      leafMemoIds.add(node.id);
+      const list = leafMemosByOwner.get(ownerId);
+      if (list) list.push(node);
+      else leafMemosByOwner.set(ownerId, [node]);
     }
   }
 
-  // Semantic column alignment for disconnected roots
-  const hasModels = nodes.some((n) => n.kind === "model");
-  const hasControllers = nodes.some((n) => n.kind === "controller");
+  // Build collapsible memo clusters (> threshold per owner, preserving erroring memos)
+  const usedIds = new Set<number>(nodes.map((n) => n.id));
+  const collapsedMemberIds = new Set<number>();
+  const clusterInfoByClusterNodeId = new Map<number, MemoClusterInfo>();
+  const clusters: MemoClusterInfo[] = [];
+  const clusterNodes: ReactivityNodeSnapshot[] = [];
+  const collapsedRedirectByMemberId = new Map<number, number>();
+
+  for (const [ownerId, allLeafMemos] of leafMemosByOwner.entries()) {
+    if (allLeafMemos.length <= memoCollapseThreshold) continue;
+    const healthyMembers = allLeafMemos.filter((m) => m.error === null);
+    if (healthyMembers.length < 2) continue;
+
+    const ownerNode = nodeMap.get(ownerId)!;
+    const expanded = expandedMemoOwnerIds?.has(ownerId) ?? false;
+
+    let clusterNodeId = -Math.max(1, Math.abs(ownerId));
+    while (usedIds.has(clusterNodeId)) {
+      clusterNodeId--;
+    }
+    usedIds.add(clusterNodeId);
+
+    let computedCount = 0;
+    let observerCount = 0;
+    let totalUpdates = 0;
+    let totalHits = 0;
+    let totalMisses = 0;
+    let totalVetoes = 0;
+    let maxLastSeq = 0;
+    let maxDurationMs: number | null = null;
+
+    for (const m of healthyMembers) {
+      if (m.kind === "computed") computedCount++;
+      else observerCount++;
+      totalUpdates += m.updates;
+      totalHits += m.hits;
+      totalMisses += m.misses;
+      totalVetoes += m.vetoes;
+      if (m.lastChangedSeq > maxLastSeq) maxLastSeq = m.lastChangedSeq;
+      if (
+        m.lastDurationMs !== null &&
+        (maxDurationMs === null || m.lastDurationMs > maxDurationMs)
+      ) {
+        maxDurationMs = m.lastDurationMs;
+      }
+    }
+
+    const info: MemoClusterInfo = {
+      clusterNodeId,
+      ownerId,
+      ownerLabel: ownerNode.label,
+      memberIds: healthyMembers.map((m) => m.id),
+      memberNodes: healthyMembers,
+      computedCount,
+      observerCount,
+      hiddenCount: healthyMembers.length,
+      expanded,
+    };
+    clusters.push(info);
+
+    if (!expanded) {
+      clusterInfoByClusterNodeId.set(clusterNodeId, info);
+      for (const m of healthyMembers) {
+        collapsedMemberIds.add(m.id);
+        collapsedRedirectByMemberId.set(m.id, clusterNodeId);
+      }
+      const dominantKind: NodeKind =
+        computedCount >= observerCount ? "computed" : "observer";
+      const clusterSnapshot: ReactivityNodeSnapshot = {
+        id: clusterNodeId,
+        kind: dominantKind,
+        label: `+${healthyMembers.length} memos`,
+        subtitle: ownerNode.label,
+        site: null,
+        connected: ownerNode.connected,
+        updates: totalUpdates,
+        hits: totalHits,
+        misses: totalMisses,
+        vetoes: totalVetoes,
+        lastDurationMs: maxDurationMs,
+        lastChangedSeq: maxLastSeq,
+        lastCauseLabel: null,
+        lastCauseNodeId: ownerId,
+        value: null,
+        error: null,
+        ownerNodeId: ownerId,
+      };
+      clusterNodes.push(clusterSnapshot);
+      inferredOwnerByMemoId.set(clusterNodeId, ownerId);
+    }
+  }
+
+  const activeNodes: ReactivityNodeSnapshot[] = [];
   for (const node of nodes) {
-    if ((incoming.get(node.id)?.length ?? 0) > 0) continue;
-    const base = layerById.get(node.id) ?? 0;
+    if (!collapsedMemberIds.has(node.id)) {
+      activeNodes.push(node);
+    }
+  }
+  for (const cn of clusterNodes) {
+    activeNodes.push(cn);
+  }
+
+  // Rewire edges targeting collapsed leaf memos into a single summary edge per cluster
+  const activeEdges: ReactivityEdgeSnapshot[] = [];
+  const clusterEdgeAgg = new Map<
+    number,
+    {
+      readonly ownerId: number;
+      readonly clusterNodeId: number;
+      readonly kinds: Set<EdgeKind>;
+      count: number;
+      lastSeq: number;
+      readonly labels: string[];
+    }
+  >();
+
+  for (const edge of coalescedEdges) {
+    const redirectedTarget = collapsedRedirectByMemberId.get(edge.targetId);
+    if (redirectedTarget !== undefined) {
+      let agg = clusterEdgeAgg.get(redirectedTarget);
+      if (!agg) {
+        agg = {
+          ownerId: edge.sourceId,
+          clusterNodeId: redirectedTarget,
+          kinds: new Set(),
+          count: 0,
+          lastSeq: 0,
+          labels: [],
+        };
+        clusterEdgeAgg.set(redirectedTarget, agg);
+      }
+      agg.kinds.add(edge.kind);
+      agg.count += edge.count;
+      if (edge.lastSeq > agg.lastSeq) agg.lastSeq = edge.lastSeq;
+      if (edge.label) agg.labels.push(edge.label);
+      continue;
+    }
+    if (collapsedMemberIds.has(edge.sourceId)) continue;
+    activeEdges.push(edge);
+  }
+
+  for (const agg of clusterEdgeAgg.values()) {
+    const info = clusterInfoByClusterNodeId.get(agg.clusterNodeId)!;
+    const edgeKind: EdgeKind =
+      info.computedCount >= info.observerCount
+        ? "memo-compute"
+        : "memo-observe";
+    activeEdges.push({
+      id: `${agg.ownerId}->${agg.clusterNodeId}:${edgeKind}:cluster`,
+      sourceId: agg.ownerId,
+      targetId: agg.clusterNodeId,
+      kind: edgeKind,
+      label: `${info.hiddenCount} memos`,
+      count: agg.count,
+      lastSeq: agg.lastSeq,
+      lastDetail: agg.labels.length > 0 ? agg.labels.join(", ") : null,
+    });
+  }
+
+  // Semantic column hints for disconnected roots
+  const hasModels = activeNodes.some((n) => n.kind === "model");
+  const hasControllers = activeNodes.some((n) => n.kind === "controller");
+  const hasElements = activeNodes.some((n) => n.kind === "element");
+
+  const activeSnapshotById = new Map<number, ReactivityNodeSnapshot>();
+  const formattedTitleById = new Map<number, string>();
+  const formattedTitleLinesById = new Map<number, TwoLineTitle>();
+  const isCompactById = new Map<number, boolean>();
+
+  const layoutNodes: LayoutNodeInput[] = [];
+  for (const node of activeNodes) {
+    activeSnapshotById.set(node.id, node);
+    const { displayText, disambiguator } = buildDisplayTitle(node);
+    const badgeAndLeftPad =
+      node.kind === "model" || node.kind === "context" ? 76 : 68;
+    const rightFlagReserve =
+      node.error !== null
+        ? 44
+        : node.kind === "element" && node.rootType
+          ? 52
+          : 18;
+
+    const fullTitleForWidth = disambiguator
+      ? `${displayText} ${disambiguator}`
+      : displayText;
+    const titleNeed =
+      measureTextPx(fullTitleForWidth, TITLE_FONT) +
+      badgeAndLeftPad +
+      rightFlagReserve;
+    const subSample = node.value?.text ?? node.subtitle ?? "";
+    const subNeed = subSample
+      ? Math.min(276, measureTextPx(subSample, SUB_FONT) + 32)
+      : 0;
+    const cardWidth = clamp(
+      MIN_CARD_WIDTH,
+      MAX_CARD_WIDTH,
+      Math.ceil(Math.max(MIN_CARD_WIDTH, titleNeed, subNeed)),
+    );
+
+    const availTitlePx = cardWidth - badgeAndLeftPad - rightFlagReserve;
+    const formattedTitle = smartTruncateToPx(
+      displayText,
+      availTitlePx,
+      TITLE_FONT,
+      disambiguator,
+    );
+    const formattedLines = splitTwoLineTitle(
+      displayText,
+      availTitlePx,
+      TITLE_FONT,
+      disambiguator,
+    );
+    formattedTitleById.set(node.id, formattedTitle);
+    formattedTitleLinesById.set(node.id, formattedLines);
+
+    const isClusterCard = clusterInfoByClusterNodeId.has(node.id);
+    const isLeafMemo = leafMemoIds.has(node.id) || isClusterCard;
+    const isCompactMemo = isLeafMemo && node.error === null;
+    isCompactById.set(node.id, isCompactMemo);
+
+    const needsTall =
+      !isCompactMemo &&
+      (formattedLines.line2 !== null ||
+        node.error !== null ||
+        node.vetoes > 0 ||
+        (node.properties?.length ?? 0) >= 5);
+    const cardHeight = isCompactMemo
+      ? COMPACT_MEMO_HEIGHT
+      : needsTall
+        ? TALL_CARD_HEIGHT
+        : NODE_HEIGHT;
+
+    let minLayerHint = 0;
     if ((node.kind === "controller" || node.kind === "context") && hasModels) {
-      layerById.set(node.id, Math.max(base, 1));
+      minLayerHint = 1;
     } else if (node.kind === "element" && (hasModels || hasControllers)) {
-      layerById.set(node.id, Math.max(base, 1));
+      minLayerHint = 1;
     } else if (
       (node.kind === "computed" || node.kind === "observer") &&
-      nodes.some((n) => n.kind === "element")
+      hasElements
     ) {
-      layerById.set(node.id, Math.max(base, 2));
+      minLayerHint = 2;
     }
+
+    const ownerGroupId = inferredOwnerByMemoId.get(node.id) ?? null;
+
+    layoutNodes.push({
+      id: node.id,
+      width: cardWidth,
+      height: cardHeight,
+      sortGroup: KIND_ORDER[node.kind],
+      minLayerHint,
+      ownerGroupId,
+      anchorToOwner: isLeafMemo,
+      ownerOrder: node.error !== null ? -1 : node.id,
+    });
   }
 
-  let maxLayer = 0;
-  for (const layer of layerById.values()) {
-    if (layer > maxLayer) maxLayer = layer;
+  const edgeById = new Map<string, ReactivityEdgeSnapshot>();
+  const layoutEdges: LayoutEdgeInput[] = [];
+  for (const edge of activeEdges) {
+    edgeById.set(edge.id, edge);
+    const busGroupKey =
+      edge.kind === "event-emit"
+        ? null
+        : edge.kind === "memo-compute" || edge.kind === "memo-observe"
+          ? `${edge.sourceId}:memo`
+          : `${edge.sourceId}:${edge.kind}`;
+
+    layoutEdges.push({
+      id: edge.id,
+      sourceId: edge.sourceId,
+      targetId: edge.targetId,
+      priority: EDGE_PRIORITY[edge.kind],
+      isFeedbackHint: edge.kind === "event-emit",
+      busGroupKey,
+      labelWidth: estimateEdgeLabelWidth(edge),
+      labelHeight: 18,
+      weight:
+        edge.kind === "model-to-controller"
+          ? 3
+          : edge.kind === "controller-to-element"
+            ? 2
+            : 1,
+      minSpan: 1,
+    });
   }
 
-  const layers: ReactivityNodeSnapshot[][] = Array.from(
-    { length: maxLayer + 1 },
-    () => [],
-  );
-  for (const node of nodes) {
-    layers[layerById.get(node.id) ?? 0]?.push(node);
-  }
+  const rawLayout = computeHierarchicLayout(layoutNodes, layoutEdges, {
+    padding: CANVAS_PADDING,
+    minLayerGap: 112,
+    nodeSpacingY: ROW_GAP,
+    componentGap: 56,
+    busThreshold,
+    cornerRadius: 8,
+    uniformColumnWidth: true,
+  });
 
-  for (const layerNodes of layers) {
-    layerNodes.sort(compareNodes);
-  }
-
-  // Two-pass Sugiyama barycenter crossing reduction
-  for (let pass = 0; pass < 2; pass++) {
-    for (let l = 1; l < layers.length; l++) {
-      const prevRowById = indexLayer(layers[l - 1]!);
-      sortLayerByBarycenter(layers[l]!, incoming, prevRowById);
-    }
-    for (let l = layers.length - 2; l >= 0; l--) {
-      const nextRowById = indexLayer(layers[l + 1]!);
-      sortLayerByBarycenter(layers[l]!, outgoing, nextRowById);
-    }
-  }
-
-  let maxRows = 1;
-  for (const layerNodes of layers) {
-    if (layerNodes.length > maxRows) maxRows = layerNodes.length;
-  }
-
-  const maxColumnHeight =
-    maxRows * NODE_HEIGHT + Math.max(0, maxRows - 1) * ROW_GAP;
   const positionedNodes: PositionedNode[] = [];
-  const positionedById = new Map<number, PositionedNode>();
-  let globalMaxNodeBottom = CANVAS_PADDING + maxColumnHeight;
+  const nodeById = new Map<number, PositionedNode>();
 
-  for (let l = 0; l < layers.length; l++) {
-    const layerNodes = layers[l]!;
-    const colHeight =
-      layerNodes.length * NODE_HEIGHT +
-      Math.max(0, layerNodes.length - 1) * ROW_GAP;
-    const yOffset =
-      CANVAS_PADDING + Math.round((maxColumnHeight - colHeight) / 2);
-    const x = CANVAS_PADDING + l * (NODE_WIDTH + LAYER_GAP);
+  for (const pn of rawLayout.nodes) {
+    const snapshot = activeSnapshotById.get(pn.id)!;
+    const clusterInfo = clusterInfoByClusterNodeId.get(pn.id);
+    const formattedTitle = formattedTitleById.get(pn.id);
+    const formattedTitleLines = formattedTitleLinesById.get(pn.id);
+    const isCompactMemo = isCompactById.get(pn.id);
 
-    for (let r = 0; r < layerNodes.length; r++) {
-      const node = layerNodes[r]!;
-      const y = yOffset + r * (NODE_HEIGHT + ROW_GAP);
-      const bottom = y + NODE_HEIGHT;
-      if (bottom > globalMaxNodeBottom) globalMaxNodeBottom = bottom;
-      const positioned: PositionedNode = {
-        node,
-        layer: l,
-        row: r,
-        x,
-        y,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-      };
-      positionedNodes.push(positioned);
-      positionedById.set(node.id, positioned);
-    }
+    const nodeOut: PositionedNode = {
+      node: snapshot,
+      layer: pn.layer,
+      row: pn.row,
+      x: pn.x,
+      y: pn.y,
+      width: pn.width,
+      height: pn.height,
+      ...(isCompactMemo !== undefined ? { isCompactMemo } : {}),
+      isIsolated: pn.isIsolated,
+      ...(clusterInfo !== undefined ? { clusterInfo } : {}),
+      ...(formattedTitle !== undefined ? { formattedTitle } : {}),
+      ...(formattedTitleLines !== undefined ? { formattedTitleLines } : {}),
+    };
+    positionedNodes.push(nodeOut);
+    nodeById.set(pn.id, nodeOut);
   }
 
-  // Count outgoing forward edges per source so multi-fanout edge pills stagger cleanly
-  const outCounts = new Map<number, number>();
-  const outSeen = new Map<number, number>();
-  for (const edge of coalescedEdges) {
-    if (edge.kind !== "event-emit") {
-      outCounts.set(edge.sourceId, (outCounts.get(edge.sourceId) ?? 0) + 1);
-    }
-  }
+  const routedEdges: RoutedEdge[] = rawLayout.edges.map((re) => ({
+    edge: edgeById.get(re.id)!,
+    x1: re.x1,
+    y1: re.y1,
+    x2: re.x2,
+    y2: re.y2,
+    path: re.path,
+    labelX: re.labelX,
+    labelY: re.labelY,
+    isFeedback: re.isFeedback,
+    points: re.points,
+    reversed: re.reversed,
+    busGroupKey: re.busGroupKey,
+    isBusMember: re.isBusMember,
+  }));
 
-  let feedbackIdx = 0;
-  let maxFeedbackY = globalMaxNodeBottom;
-
-  const routedEdges: RoutedEdge[] = coalescedEdges.map((edge) => {
-    const src = positionedById.get(edge.sourceId)!;
-    const dst = positionedById.get(edge.targetId)!;
-    const isFeedback = edge.kind === "event-emit" || dst.x <= src.x;
-
-    if (!isFeedback) {
-      const x1 = src.x + src.width;
-      const y1 = src.y + src.height / 2;
-      const x2 = dst.x;
-      const y2 = dst.y + dst.height / 2;
-      const dx = Math.max(48, (x2 - x1) * 0.5);
-      const path = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
-
-      // Stagger label position along cubic curve when source fans out to multiple targets
-      const totalFan = outCounts.get(edge.sourceId) ?? 1;
-      const fanIndex = outSeen.get(edge.sourceId) ?? 0;
-      outSeen.set(edge.sourceId, fanIndex + 1);
-      const t = totalFan <= 1 ? 0.5 : fanIndex % 2 === 0 ? 0.42 : 0.58;
-      const omt = 1 - t;
-      const c1x = x1 + dx;
-      const c2x = x2 - dx;
-      const lx =
-        omt * omt * omt * x1 +
-        3 * omt * omt * t * c1x +
-        3 * omt * t * t * c2x +
-        t * t * t * x2;
-      const ly =
-        omt * omt * omt * y1 +
-        3 * omt * omt * t * y1 +
-        3 * omt * t * t * y2 +
-        t * t * t * y2;
-
-      return {
-        edge,
-        x1,
-        y1,
-        x2,
-        y2,
-        path,
-        labelX: Math.round(lx),
-        labelY: Math.round(ly) - 8,
-        isFeedback: false,
-      };
-    }
-
-    // Route feedback / upward event arcs cleanly below ALL positioned nodes so they never cross cards
-    const x1 = src.x + src.width * 0.5;
-    const y1 = src.y + src.height;
-    const x2 = dst.x + dst.width * 0.5;
-    const y2 = dst.y + dst.height;
-    const clearanceY = globalMaxNodeBottom + 32 + feedbackIdx * 26;
-    feedbackIdx++;
-    if (clearanceY > maxFeedbackY) maxFeedbackY = clearanceY;
-
-    const path = `M ${x1} ${y1} C ${x1} ${clearanceY}, ${x2} ${clearanceY}, ${x2} ${y2}`;
-    const midY = 0.125 * y1 + 0.75 * clearanceY + 0.125 * y2;
+  const trunkKindByKey = new Map<string, EdgeKind>();
+  const busTrunks: BusTrunkSegment[] = rawLayout.busTrunks.map((bt) => {
+    const firstMemberId = bt.memberEdgeIds[0];
+    const kind: EdgeKind =
+      (firstMemberId ? edgeById.get(firstMemberId)?.kind : undefined) ??
+      "prop-flow";
+    trunkKindByKey.set(bt.busGroupKey, kind);
     return {
-      edge,
-      x1,
-      y1,
-      x2,
-      y2,
-      path,
-      labelX: Math.round((x1 + x2) / 2),
-      labelY: Math.round(midY) + 10,
-      isFeedback: true,
+      busGroupKey: bt.busGroupKey,
+      layerIndex: bt.layerIndex,
+      sourceId: bt.sourceId,
+      kind,
+      x: bt.x,
+      yStart: bt.yStart,
+      yEnd: bt.yEnd,
+      path: bt.path,
+      memberEdgeIds: bt.memberEdgeIds,
     };
   });
 
-  const width =
-    CANVAS_PADDING * 2 +
-    layers.length * NODE_WIDTH +
-    Math.max(0, layers.length - 1) * LAYER_GAP;
-  const height = Math.max(
-    CANVAS_PADDING * 2 + maxColumnHeight,
-    maxFeedbackY + 28,
-  );
+  const junctions: BusJunctionPoint[] = rawLayout.junctions.map((j) => ({
+    x: j.x,
+    y: j.y,
+    kind: trunkKindByKey.get(j.busGroupKey) ?? "prop-flow",
+    busGroupKey: j.busGroupKey,
+  }));
 
   return {
     nodes: positionedNodes,
     edges: routedEdges,
-    nodeById: positionedById,
-    width,
-    height,
-    layerCount: layers.length,
+    nodeById,
+    width: rawLayout.width,
+    height: rawLayout.height,
+    layerCount: rawLayout.layerCount,
+    clusters,
+    busTrunks,
+    junctions,
   };
-}
-
-function compareNodes(
-  a: ReactivityNodeSnapshot,
-  b: ReactivityNodeSnapshot,
-): number {
-  const kindDiff = KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
-  if (kindDiff !== 0) return kindDiff;
-  return a.id - b.id;
-}
-
-function indexLayer(
-  layerNodes: ReadonlyArray<ReactivityNodeSnapshot>,
-): Map<number, number> {
-  const map = new Map<number, number>();
-  for (let i = 0; i < layerNodes.length; i++) {
-    map.set(layerNodes[i]!.id, i);
-  }
-  return map;
-}
-
-function sortLayerByBarycenter(
-  layerNodes: ReactivityNodeSnapshot[],
-  adjacency: ReadonlyMap<number, ReadonlyArray<number>>,
-  neighborIndices: ReadonlyMap<number, number>,
-): void {
-  const originalOrder = indexLayer(layerNodes);
-  layerNodes.sort((a, b) => {
-    const scoreA = computeBarycenter(
-      a.id,
-      adjacency,
-      neighborIndices,
-      originalOrder.get(a.id) ?? 0,
-    );
-    const scoreB = computeBarycenter(
-      b.id,
-      adjacency,
-      neighborIndices,
-      originalOrder.get(b.id) ?? 0,
-    );
-    if (scoreA !== scoreB) return scoreA - scoreB;
-    return compareNodes(a, b);
-  });
-}
-
-function computeBarycenter(
-  nodeId: number,
-  adjacency: ReadonlyMap<number, ReadonlyArray<number>>,
-  neighborIndices: ReadonlyMap<number, number>,
-  fallbackIndex: number,
-): number {
-  const neighbors = adjacency.get(nodeId) ?? [];
-  let sum = 0;
-  let count = 0;
-  for (const neighborId of neighbors) {
-    const idx = neighborIndices.get(neighborId);
-    if (idx !== undefined) {
-      sum += idx;
-      count += 1;
-    }
-  }
-  return count > 0 ? sum / count : fallbackIndex;
 }
